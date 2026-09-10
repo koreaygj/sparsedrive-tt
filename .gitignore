@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+*.so
+
+# Virtual environments
+.venv/
+venv/
+
+# Model weights & anchors
+checkpoints/
+ckpt/
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.npy
+*.npz
+*.pkl
+
+# Datasets & caches
+dataset/
+data/
+exp/
+cache/
+*.db
+
+# TT-Metal generated artifacts
+generated/
+tt_build/
+*.tt_report
+profiler_logs/
+
+# Logs & debug output
+logs/
+*.log
+debug/
+
+# Outputs & visualizations
+outputs/
+vis/
+*.mp4
+*.png
+*.jpg
+
+# Editor & OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
