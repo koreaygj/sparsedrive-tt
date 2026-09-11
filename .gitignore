@@ -26,6 +26,8 @@ ckpt/
 dataset/
 data/
 exp/
+# exp is a symlink to /mnt/data2; the 'exp/' pattern above does not match a symlink
+exp
 cache/
 *.db
 

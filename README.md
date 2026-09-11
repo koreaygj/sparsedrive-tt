@@ -11,16 +11,34 @@ carries over. The scale does not — see [Deformable aggregation](#deformable-ag
 
 ## Status
 
-Phase 0 (environment) complete. Nothing runs on device yet.
+Phases 0 (environment) and 1 (PyTorch reference) complete. Nothing runs on
+device yet.
 
 | | |
 |---|---|
 | Environment | `source env.sh` — 2 interpreters, both verified |
 | Custom kernels | 9/9 present in the installed `ttnn` |
 | Assets | backbone + 3 anchor vocabularies downloaded |
-| PyTorch reference | full model forward, 400/400 checkpoint tensors matched, GPU 0.42 s / CPU 9.3 s |
+| PyTorch reference | 400/400 checkpoint tensors matched, 0.239 s/frame on GPU |
 | CPU/GPU parity | worst PCC 0.999997 across 11 intermediate tensors |
+| **navtest PDMS** | **0.9222 — matches the published 92.22, 12146/12146 valid** |
+| Golden tensors | 8 frames x 156 tensors, plus 2 frames of DAF kernel arguments |
 | TT-NN model | not started |
+
+### Reference baseline — NAVSIM v1, navtest, `sparsedrive_navsimv1_92p2.ckpt`
+
+| metric | value |
+|---|---:|
+| **score (PDMS)** | **0.9222** |
+| no_at_fault_collisions | 0.9869 |
+| drivable_area_compliance | 0.9844 |
+| time_to_collision_within_bound | 0.9529 |
+| ego_progress | 0.8865 |
+| comfort | 0.9998 |
+| driving_direction_compliance | 0.9611 |
+
+12146 scenes, 0 failed, 53 min end to end. This is the number the port is
+graded against. Reproduce with `scripts/eval_navtest_v1.sh`.
 
 ## Setup
 
@@ -126,6 +144,35 @@ ckpt/sparsedrive_navsimv{1,2}.ckpt    -> ../checkpoints/
 The vocabularies are also inside the checkpoint as buffers, but the config reads
 the `.npy`/`.npz` files at construction time, so they must exist regardless.
 
+## Caches
+
+Both are required by the evaluation entrypoint — `CacheOnlyDataset` reads the
+first, `MetricCacheLoader` the second.
+
+```bash
+source env.sh
+$NAVSIM_PY $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_dataset_caching.py \
+    agent=sparsedrive_agent experiment_name=cache_navtest \
+    train_test_split=navtest cache_path=$NAVSIM_EXP_ROOT/data_cache_navtest
+
+$NAVSIM_PY $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_metric_caching_v1.py \
+    train_test_split=navtest \
+    cache.cache_path=$NAVSIM_EXP_ROOT/metric_cache_navtestv1
+```
+
+| cache | scenes | size | wall |
+|---|---:|---:|---:|
+| `data_cache_navtest` | 12,146 | 144 MB | 15 min |
+| `metric_cache_navtestv1` | 12,146 | 3.1 GB | 15 min |
+
+The dataset cache holds image *paths* and calibration, not pixels; the feature
+pipeline loads and normalises images at `__getitem__` time.
+
+`exp/` is a symlink to `/mnt/data2`, which has the room.
+
+Ray's `Failed to establish connection to the metrics exporter agent` is
+telemetry noise — the run that printed it 32 times cached all 12,146 scenes.
+
 ## Deformable aggregation, the hard part
 
 Derived from `weights_fc` shapes in the checkpoint, confirmed against
@@ -164,6 +211,9 @@ env.sh                  environment, both interpreters
 reference/daf_torch.py    pure-PyTorch deformable aggregation (CPU reference)
 reference/__init__.py   install() -- fake extension modules, call before navsim imports
 reference/pcc.py        PCC helper, the accuracy gate used throughout
+shim/sitecustomize.py   installs the DAF stand-in into ray workers too
+tools/dump_golden.py    golden tensor dump from real navtest frames
+scripts/eval_navtest_v1.sh  full navtest PDMS run of the reference
 test/test_daf_torch.py  daf_torch vs transcription of the CUDA kernel
 test/test_forward_smoke.py  full model + real weights, one forward (--device, --parity)
 test/test_gpu_parity.py     cpu vs cuda on intermediate tensors, permutation-aware
@@ -179,5 +229,33 @@ source env.sh
 $NAVSIM_PY test/test_daf_torch.py                     # op vs CUDA-kernel transcription
 $NAVSIM_PY test/test_forward_smoke.py --device cuda   # full model, real weights
 $NAVSIM_PY test/test_forward_smoke.py --parity        # cpu vs cuda, final output
+$NAVSIM_PY test/test_real_frame.py                    # real navtest frames end to end
 cd test && $NAVSIM_PY test_gpu_parity.py              # cpu vs cuda, intermediates
 ```
+
+## Golden tensors
+
+```bash
+source env.sh
+$NAVSIM_PY tools/dump_golden.py --frames 8                      # -> exp/golden
+$NAVSIM_PY tools/dump_golden.py --frames 2 --with-dfa-internals # -> DAF kernel args
+```
+
+Each frame is a flat `{name: cpu fp32 tensor}` dict holding both the **input
+and the output** of every module on the porting list, so a TT-NN module can be
+graded standalone without replaying everything upstream of it. Real navtest
+frames, not synthetic — anchors projecting out of frame and softmax rows with
+no in-bounds camera only occur on real geometry.
+
+`--with-dfa-internals` additionally captures the arguments of all three
+deformable-aggregation calls, measured here:
+
+| call | points | `weights` | `out` |
+|---|---:|---:|---:|
+| `DAF[0]` layer 0, path | 512,000 | 49.15M | **131.07M (524 MB)** |
+| `DAF[1]` layer 1, path | 64,000 | 6.14M | 16.38M |
+| `DAF[2]` layer 1, trajectory | 32,000 | 3.07M | 8.19M |
+
+`DAF[0].out` is summed over the P axis immediately on return, collapsing
+131.07M elements to 262K. Folding that reduction into `grouped_weighted_sum`
+is the first thing to prove in Phase 2.
