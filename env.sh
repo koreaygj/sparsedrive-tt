@@ -63,7 +63,9 @@ export TT_PY="${TT_PY:-$HOME/.tenstorrent-venv/bin/python}"
 # PYTHONPATH is searched before site-packages .pth entries, so this wins.
 # ttnn lives under $TT_METAL_HOME/ttnn (NOT $TT_METAL_HOME -- that path makes
 # `import ttnn` resolve to an empty namespace package that silently has no ops).
-_sd_pp="$NAVSIM_DEVKIT_ROOT:$TT_METAL_HOME/ttnn:$TT_METAL_HOME:$TT_METAL_HOME/tools"
+# shim/ holds sitecustomize.py, which Python imports at startup -- that is how
+# the deformable-aggregation stand-in reaches ray workers spawned by navsim.
+_sd_pp="$SPARSEDRIVE_TT_ROOT/shim:$NAVSIM_DEVKIT_ROOT:$TT_METAL_HOME/ttnn:$TT_METAL_HOME:$TT_METAL_HOME/tools"
 case ":${PYTHONPATH}:" in
   *":$NAVSIM_DEVKIT_ROOT:"*) ;;
   *) export PYTHONPATH="$_sd_pp${PYTHONPATH:+:$PYTHONPATH}" ;;
