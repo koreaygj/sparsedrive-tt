@@ -258,12 +258,88 @@ grid from 160.9 ms to 62.5 ms. Cast on the host.
 
 Eight times the channels, identical time. The cost is the per-point coordinate
 work, not the gather, which is why `ttnn.grid_precompute` exists -- it moves
-that work out of the sampler. It also means `grid_compact` buys less than the
+that work out of the sampler. The next section confirms that directly: the
+coordinate work is soft float on a core with no FPU, and it is 70% of the op. It also means `grid_compact` buys less than the
 visible-point fraction suggests: dropping 68% of the points drops 68% of the
 per-point cost and nothing else.
 
 For scale: 6.14M samples x 4 neighbours x 256 channels is 6.3 GMAC, about
 0.2 ms at bf16 peak. The op takes 186 ms. Nothing here is FPU-bound.
+
+### grid_sample's coordinate math runs in soft float on an FPU-less core
+
+Not the SFPU, and not the FPU. Checked in the source before measuring:
+
+- `ttnn/.../pool/grid_sample/device/kernels/` holds only `dataflow/` kernels.
+  The one compute kernel the bilinear factory registers is
+  `pool/generic/.../compute_pool_2d.cpp` with `AVG_POOL2D` defines -- that is
+  the final 4-corner blend, on the FPU, and nothing else.
+- the coordinates are derived in `grid_sample_reader_common.hpp`'s
+  `read_grid_point`, which is a *dataflow* kernel on RISCV_0/RISCV_1.
+- those cores have no floating-point unit:
+
+      $ riscv-tt-elf-gcc -mcpu=tt-wh -Q --help=target
+        -march=  rv32im_zmmul     -mabi=  ilp32
+      Tag_RISCV_arch: "rv32i2p0_m2p0_zmmul1p0"
+
+  No `F` extension, soft-float ABI. Each point's two affine multiplies, two
+  `floor`s, four float/int conversions, and four weight products are libgcc
+  calls on a scalar core -- 20-odd of them per point.
+
+Measured by feeding the same points as a precomputed 6-field grid, which makes
+the reader do six loads and no float work at all:
+
+    level      standard    precomputed   ratio      PCC
+    64x128      72.9 ms        22.1 ms   3.30x   0.999790
+    32x64       73.7 ms        22.0 ms   3.35x   0.999891
+    16x32       74.4 ms        22.2 ms   3.35x   0.999964
+    8x16        75.0 ms        22.1 ms   3.39x   0.999982
+    total      296.0 ms        88.4 ms   3.35x
+
+    per point  48.2 ns        14.4 ns
+
+So 70% of `grid_sample` is soft float in the reader. Two things fall out: a
+feature map 64x smaller takes the *same* time, which is the per-point result
+above stated a second way; and the precomputed path is the more accurate one,
+because the host derives the coordinates in fp32 while a bf16 grid has already
+lost them.
+
+The catch is bytes. Precomputed is 6 values per point against 2, so building it
+on the host triples the grid upload and gives the win back. It has to be
+`ttnn.grid_precompute`, on device, which is why that op takes a compacted Q14
+grid and couples to `grid_compact`.
+
+### The mask's layout, not its size, was what made it expensive
+
+The DFA mask depends on camera and point only. Under the checkpoint's
+(camera, level, point, group) clp order it therefore repeats along two axes at
+once -- stride P*G for the level, stride 1 for the group -- and no stock op
+expands that cheaply: `repeat_interleave` by G=8 is sub-tile, and tiling the
+result L times concatenates 94 MB four times. 80.8 ms, against 58.6 to build it
+on the host and ship it. The first attempt to move it on device was rejected on
+that measurement.
+
+Reordering clp to (camera, point, level) puts the mask constant over the
+trailing `num_levels * num_groups = 32` columns, which is exactly one tile:
+
+    host build + 94 MB upload     20.0 + 38.6 = 58.6 ms
+    1.5 MB base + repeat_interleave(32)  0.8 + 3.7 =  4.5 ms
+
+13x, and the reorder is free -- `weights_fc`'s rows are permuted once at load,
+`features` is assembled in the matching order (123.0 ms against 122.9), and
+`grouped_weighted_sum` only sums over clp, so the order inside it never
+mattered. Frame time 586.6 -> 516.2 ms, trajectory bit-identical.
+
+Other expansions measured, for the record:
+
+    repeat_interleave(32, dim=-1) on [m, C*P]      3.7 ms
+    broadcast multiply [m,CP,1] x [1,1,32]         9.4 ms
+    matmul [m*CP,1] @ [1,32]                       9.3 ms
+    reshape [m,CP,1] + repeat(1,1,32)             51.2 ms
+
+Not expanding at all -- masking `e` as [m, CP, 32] against a [m, CP, 1] base --
+loses, because reshaping `e` from [m, 48000] to [m, 1500, 32] in TILE costs
+20.3 ms, more than the expansion it saves.
 
 ### The device was half idle for most of this port
 
