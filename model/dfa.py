@@ -21,6 +21,10 @@ short version:
     with the strided per-group sum done as a 0/1 matmul. Its two matmuls need
     different fidelity: the gather is bf16 x 0/1 (fidelity irrelevant), the
     scatter takes the fp32 denominator (LoFi truncates it).
+  - clp is ordered (camera, point, level), not the (camera, level, point) the
+    checkpoint emits. The mask is constant over level and group, so that order
+    puts it constant over the last L*G = 32 columns -- exactly a tile width --
+    and one repeat_interleave builds it on device. See _mask_layout_perm.
   - the mask silences a camera only where another camera sees the point, which
     is also what keeps the denominator non-zero.
   - features never exist whole -- 2.93 GiB at layer 0 -- so anchors are walked
@@ -48,6 +52,29 @@ FIX_HEIGHT = (0.0, -0.25, -0.5, 0.25, 0.5)
 NUM_LEARNABLE = 2
 LOFI = dict(math_fidelity=ttnn.MathFidelity.LoFi, fp32_dest_acc_en=True, packer_l1_acc=True)
 HIFI = dict(math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, packer_l1_acc=True)
+
+
+def _mask_layout_perm(L, P, G):
+    """Reorder one camera's weights_fc outputs from (level, point, group) to
+    (point, level, group).
+
+    The mask depends on camera and point only, never on level or group. Under
+    the checkpoint's (l, p, g) order it therefore repeats along two axes at
+    once -- stride P*G for the level and stride 1 for the group -- and no stock
+    op expands it cheaply: repeat_interleave by G=8 is sub-tile, and tiling the
+    result L times concatenates 94 MB four times. Measured 80.8 ms, against
+    58.6 ms to build the same thing on the host and ship it.
+
+    Under (p, l, g) the mask is constant over the trailing L*G = 32 columns,
+    which is one tile wide, so a single repeat_interleave(32) is a tile-aligned
+    copy: 3.7 ms, plus 0.8 ms to upload the [n, C*P] base it expands from.
+
+    Nothing numeric changes. This permutes the rows of weights_fc's weight and
+    bias once at load, and `features` is assembled in the matching order, so
+    grouped_weighted_sum sees the same (weight, feature) pairs it saw before --
+    it only sums over clp, so the order within clp never mattered to it.
+    """
+    return torch.arange(L * P * G).reshape(L, P, G).permute(1, 0, 2).reshape(-1)
 
 
 def legal_splits(clp, G=8):
@@ -92,8 +119,13 @@ class TtDFA:
 
         self.Wl = T(g("kps_generator.learnable_fc.weight").t(), ttnn.float32)
         self.Bl = T(g("kps_generator.learnable_fc.bias").reshape(1, -1), ttnn.float32)
-        self.Wf = T(g("weights_fc.weight").t())
-        self.Bf = T(g("weights_fc.bias").reshape(1, -1))
+        # (l, p, g) -> (p, l, g); see _mask_layout_perm.
+        self.LG = num_levels * num_groups
+        assert self.LG % 32 == 0, (
+            f"the mask expansion wants num_levels*num_groups tile-aligned, got {self.LG}")
+        wp = _mask_layout_perm(num_levels, self.P, num_groups)
+        self.Wf = T(g("weights_fc.weight")[wp].t())
+        self.Bf = T(g("weights_fc.bias")[wp].reshape(1, -1))
         self.Wo = T(g("output_proj.weight").t())
         self.Bo = T(g("output_proj.bias").reshape(1, -1))
         self.ce_w = [T(g(f"camera_encoder.{i}.weight").t()) for i in (0, 3)]
@@ -182,16 +214,22 @@ class TtDFA:
         ttnn.deallocate(x); ttnn.deallocate(y)
         return torch.stack(grids, 0).reshape(self.C, n * self.P, 1, 2), torch.stack(inb, 1)
 
-    def _weights(self, feat_tt, cam, n, keep):
-        """n is the global anchor count; each device holds n // nd of them."""
+    def _weights(self, feat_tt, cam, n, base):
+        """n is the global anchor count; each device holds n // nd of them.
+
+        `base` is the mask at [n, C*P], one value per (camera, point); the
+        expansion to the full [n, clp*G] happens here, on device.
+        """
         nl = n // self.nd
         fx = ttnn.add(ttnn.reshape(feat_tt, (nl, 1, self.E)),
                       ttnn.reshape(cam, (1, self.C, self.E)))
         wl = ttnn.linear(ttnn.reshape(fx, (nl * self.C, self.E)), self.Wf, bias=self.Bf,
                          compute_kernel_config=self.hi)
         logits = ttnn.reshape(wl, (nl, self.wide))
+        keep = ttnn.repeat_interleave(base, self.LG, dim=-1)
         mx = ttnn.max(logits, dim=-1, keepdim=True)
         e = ttnn.multiply(ttnn.exp(ttnn.subtract(logits, mx)), keep)
+        ttnn.deallocate(keep)
         s = ttnn.matmul(e, self.gt, compute_kernel_config=self.lo, dtype=self.f32)
         sb = ttnn.matmul(s, self.st, compute_kernel_config=self.hi, dtype=self.f32)
         ttnn.deallocate(s)
@@ -237,10 +275,12 @@ class TtDFA:
             f_tt = self.S(feat[a0:a1])
             grid, inb = self._project(self.S(feat[a0:a1], self.f32),
                                       self.S(anchor[a0:a1], self.f32), m, proj, iwh)
-            mp = inb[:, :, None, :, None]
-            keep = (~torch.logical_and(~mp, mp.sum(1, keepdim=True) != 0)).float()
-            keep = keep.expand(m, self.C, self.L, self.P, self.G).reshape(m, self.wide)
-            W = self._weights(f_tt, cam, m, self.S(keep))
+            # [m, C, P] -- the (camera, point) mask, unexpanded. The
+            # expansion to [m, clp*G] is a device repeat_interleave inside
+            # _weights: 94 MB of transfer becomes 1.5 MB. inb is [m, C, P].
+            seen = inb.sum(1, keepdim=True) != 0
+            base = (~torch.logical_and(~inb, seen)).float().reshape(m, self.C * self.P)
+            W = self._weights(f_tt, cam, m, self.S(base))
             # grid is [C, m*P, 1, 2] with points anchor-major, so sharding dim 1
             # splits the same anchors that dim 0 of feat did.
             # Upload wide, reshape on device.
@@ -262,10 +302,18 @@ class TtDFA:
                 (self.C, (m // self.nd) * self.P, 1, 2))
             ml = m // self.nd
             per = []
+            # clp is (camera, point, level): concat on the level axis with the
+            # point axis already outside it. The old (camera, level, point)
+            # order concatenated four [C, P, ml, E] blocks on dim 1; this
+            # concatenates four [C*P, 1, ml, E] blocks on dim 1 instead.
+            # Measured identical, 123.0 ms against 122.9 -- the reorder is free,
+            # and it is what lets the mask expand on device.
             for fm in levels_tt:
                 s_ = ttnn.grid_sample(fm, g_tt, padding_mode="zeros", align_corners=False)
-                per.append(ttnn.permute(ttnn.reshape(s_, (self.C, ml, self.P, self.E)),
-                                        (0, 2, 1, 3)))
+                per.append(ttnn.reshape(
+                    ttnn.permute(ttnn.reshape(s_, (self.C, ml, self.P, self.E)),
+                                 (0, 2, 1, 3)),
+                    (self.C * self.P, 1, ml, self.E)))
             feats = ttnn.reshape(ttnn.concat(per, dim=1), (self.clp, ml, self.E))
             sl = self.clp // splits
             acc = torch.zeros(m, self.E)
