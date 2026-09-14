@@ -31,6 +31,9 @@ short version:
     and one repeat_interleave builds it on device. See _mask_layout_perm.
   - the mask silences a camera only where another camera sees the point, which
     is also what keeps the denominator non-zero.
+  - the clp reduction is NOT sliced. grouped_weighted_sum's own num_chunks
+    splits it instead, which bounds the bf16 accumulator the same way while
+    also being what fills the device -- see GWS_CHUNKS.
   - features never exist whole -- 2.93 GiB at layer 0 -- so anchors are walked
     in blocks, and the clp reduction is split to bound the bf16 accumulator.
 """
@@ -59,6 +62,40 @@ def _cast(x, dt):
 # output flattens back to point order.
 GP_K = 16
 Q14_SHIFT = 14                     # must match grid_precompute and grid_sample
+
+# How many partial sums grouped_weighted_sum splits the clp reduction into. It
+# sets two things at once:
+#
+#   parallelism -- work units are ceil(anchors/32) * num_chunks, and this DFA
+#     reduces 6000 clp into 512 anchors a chip, so 16 tile rows. The op's old
+#     fixed 2 gave 32 work units on a 64-core device: half of it idle, which is
+#     why the reduction measured 33 GiB/s against a 288 GiB/s part.
+#   accuracy -- each partial accumulates in bf16 through the packer, so the
+#     drift grows with its depth. This is what the `splits` slicing used to buy.
+#
+# The op alone, layer 0's reduction on the mesh, against an fp64 replay:
+#
+#   num_chunks   work units   clp/partial   gws      PCC vs fp64
+#            2           32          3000   41.7 ms    0.998712
+#            4           64          1500   21.0 ms    0.999262
+#            8          128           750   20.9 ms    0.999605
+#           16          256           375   21.0 ms    0.999858
+#
+# 2 -> 4 is the idle half of the device being filled; past that it is flat,
+# because the work units are exact multiples of the 64 cores. So the depth is
+# free, and the whole DFA against the PyTorch reference says take it:
+#
+#   num_chunks   DAF[0]     DAF[1]     DAF[2]
+#            8   0.999671   0.998983   0.999986
+#           16   0.999883   0.999704   0.999987
+#           30   0.999958   0.999905   0.999988      <- 152 / 27 / 16 ms
+#           40   0.999972   0.999932   0.999988
+#
+# 30 over 40 because DAF[1] has only 4 tile rows, so 40 is 160 work units on
+# 64 cores -- 2.5 rounds -- and it measured slower there. 30 beats what the
+# old splits=10 x num_chunks=2 managed (0.999919 / 0.999817 / 0.999987) on
+# every call, and 6000 and 960 are both divisible by it.
+GWS_CHUNKS = 30
 
 FIX_HEIGHT = (0.0, -0.25, -0.5, 0.25, 0.5)
 NUM_LEARNABLE = 2
@@ -229,6 +266,10 @@ class TtDFA:
         # shapes the feature tensors carry. It depends on nothing else, so all
         # three DFA instances would build the same one.
         self._consts, self._consts_key = None, None
+        # num_chunks must divide clp exactly -- the reader hands the compute
+        # kernel a fixed page count per work unit, and a ragged last chunk
+        # leaves it waiting for pages that never come.
+        self.nchunks = max(k for k in (GWS_CHUNKS, 8, 4, 2, 1) if self.clp % k == 0)
 
     def upload_levels(self, mc_ms_feat, shapes, starts):
         """[1, C, F, E] -> per-level NHWC on device. Once per frame."""
@@ -348,7 +389,7 @@ class TtDFA:
         """
         n = feat.shape[0]
         if splits is None:
-            splits = max(k for k in legal_splits(self.clp) if k <= 10)
+            splits = 1
         assert splits in legal_splits(self.clp), \
             f"clp {self.clp}: splits must be one of {legal_splits(self.clp)}"
         assert (self.P * self.nd) % GP_K == 0 or (n * self.P) % (GP_K * self.nd) == 0, \
@@ -404,17 +445,27 @@ class TtDFA:
                                  (0, 2, 1, 3)),
                     (self.C * self.P, 1, ml, self.E)))
             feats = ttnn.reshape(ttnn.concat(per, dim=1), (self.clp, ml, self.E))
+            # splits defaults to 1: slicing the reduction cost a full copy of
+            # feats -- 1.46 GiB a chip, 26.8 ms -- and bought only the shorter
+            # bf16 accumulation that num_chunks now gives for nothing.
             sl = self.clp // splits
+            mp_ = ((ml + 31) // 32) * 32
+            nc = self.nchunks
             acc = torch.zeros(m, self.E)
             for i in range(splits):
-                fi = ttnn.slice(feats, [i * sl, 0, 0], [(i + 1) * sl, ml, self.E])
-                wi = ttnn.slice(W, [0, i * sl * self.G], [ml, (i + 1) * sl * self.G])
+                fi = feats if splits == 1 else \
+                    ttnn.slice(feats, [i * sl, 0, 0], [(i + 1) * sl, ml, self.E])
+                wi = W if splits == 1 else \
+                    ttnn.slice(W, [0, i * sl * self.G], [ml, (i + 1) * sl * self.G])
                 o = ttnn.grouped_weighted_sum(fi, wi, num_groups=self.G,
-                                              group_dims=self.E // self.G)
-                mp_ = ((ml + 31) // 32) * 32
-                acc += self.G2T(ttnn.add(ttnn.slice(o, [0, 0], [ml, self.E]),
-                                         ttnn.slice(o, [mp_, 0], [mp_ + ml, self.E]))).float()
-                ttnn.deallocate(fi); ttnn.deallocate(wi); ttnn.deallocate(o)
+                                              group_dims=self.E // self.G, num_chunks=nc)
+                # o is [nc * mp_, E], one block per partial sum.
+                so = ttnn.sum(ttnn.reshape(o, (nc, mp_, self.E)), dim=0)
+                acc += self.G2T(ttnn.slice(ttnn.reshape(so, (mp_, self.E)),
+                                           [0, 0], [ml, self.E])).float()
+                if splits != 1:
+                    ttnn.deallocate(fi); ttnn.deallocate(wi)
+                ttnn.deallocate(o); ttnn.deallocate(so)
             proj_out = ttnn.linear(self.S(acc), self.Wo, bias=self.Bo,
                                    compute_kernel_config=self.hi)
             out[a0:a1] = self.G2T(ttnn.add(proj_out, f_tt)).float()[:m]
