@@ -47,8 +47,8 @@ saw on a real navtest frame.
 
 | stage | | PCC |
 |---|---|---|
-| kps_generator | not started | |
-| project_points | not started | |
+| kps_generator | **done**, fused with projection | 1.000000 |
+| project_points | **done** | 1.000000 on visible points |
 | `weights_fc` | **done** | 0.999998 |
 | mask + softmax | **done** | 0.999954 |
 | `grid_sample` | **done** | 0.9998 per level |
@@ -76,6 +76,17 @@ the host side from 439 ms to 12 ms, at the same accuracy.
   0.999999. Error grows with level width, so the 64x128 level is worst.
   `ttnn.grid_precompute`'s Q14 grid is the upgrade path if that floor bites.
 - **fp32 grids make grid_sample return NaN.** It is Q14 or bf16.
+- **Coordinates want fp32; features do not.** The keypoint/projection chain in
+  bf16 costs 4.22 px of p99 error and flips the visibility of 0.42% of visible
+  points; in fp32 those are 0.33 px and 0.03%, and it runs no slower. A path
+  point reaches 50 m, where bf16 resolves to 0.2 m. The features quantise to
+  bf16 for 0.999999. Same question, opposite answers — decide it per tensor,
+  by dynamic range against required precision, not by a blanket default.
+- **kps_generator needs no custom kernel.** sparse4D-tt wrote
+  `kps_project_fused` in Metalium for box keypoints; the path case is affine in
+  xy, so z is a per-h constant and the homogeneous 4th is 1, which lets stock
+  ops do the same fusion. Nothing ever materialises [n, 500, 3] — everything
+  stays [n, 500], which tiles without wasting 29 of every 32 columns.
 
 ### Measurement discipline
 
