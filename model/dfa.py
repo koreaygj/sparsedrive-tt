@@ -323,11 +323,19 @@ class TtDFA:
         y = ttnn.add(ttnn.matmul(off, self.Oy, compute_kernel_config=self.hi),
                      ttnn.matmul(anchor32, self.Ay, compute_kernel_config=self.hi))
         ttnn.deallocate(off)
+        # One upload for all nine per-camera constants, sliced apart on device.
+        # They are [1, P] each -- 2 KB -- and from_torch costs per call, not per
+        # byte: nine of them measured 4.6 ms a DFA call, which is more than the
+        # projection arithmetic they feed.
+        cst_all = torch.stack(
+            [(proj[c][:3, 2] * self.zc.unsqueeze(-1) + proj[c][:3, 3]).t()
+             for c in range(self.C)], 0).reshape(self.C * 3, self.P)
+        cst_tt = self.T(cst_all, self.f32)
         us, vs = [], []
         for c in range(self.C):
             Pm = proj[c]
-            cst = (Pm[:3, 2] * self.zc.unsqueeze(-1) + Pm[:3, 3]).t()
-            cx, cy, cz = (self.T(cst[i].reshape(1, -1), self.f32) for i in range(3))
+            cx, cy, cz = (ttnn.slice(cst_tt, [c * 3 + i, 0], [c * 3 + i + 1, self.P])
+                          for i in range(3))
             X = ttnn.add(ttnn.add(ttnn.multiply(x, float(Pm[0, 0])),
                                   ttnn.multiply(y, float(Pm[0, 1]))), cx)
             Y = ttnn.add(ttnn.add(ttnn.multiply(x, float(Pm[1, 0])),
@@ -339,7 +347,7 @@ class TtDFA:
             vs.append(ttnn.multiply(ttnn.divide(Y, Z), 1.0 / float(iwh[c, 1])))
             for q in (cx, cy, cz, X, Y, Z):
                 ttnn.deallocate(q)
-        ttnn.deallocate(x); ttnn.deallocate(y)
+        ttnn.deallocate(x); ttnn.deallocate(y); ttnn.deallocate(cst_tt)
 
         # --- the grid ------------------------------------------------------
         # POINT-MAJOR: grid_sample emits one output row per grid row, so the
@@ -512,11 +520,16 @@ class TtDFA:
                 f"chunk {m} must divide across {self.nd} devices; "
                 f"pick a chunk that divides {n} into multiples of {self.nd}")
             ml = m // self.nd
-            f_tt = self.S(feat[a0:a1])
+            # feat goes up ONCE. The projection wants it fp32 -- coordinates are
+            # geometry -- and everything else wants bf16, and uploading the same
+            # rows twice cost an upload for nothing.
+            f32 = self.S(feat[a0:a1], self.f32)
+            f_tt = ttnn.typecast(f32, ttnn.bfloat16)
             # Nothing comes back to the host here: both the Q14 grid and the
             # [ml, C*P] mask are built on device from u and v.
-            g_tt, base = self._project(self.S(feat[a0:a1], self.f32),
-                                       self.S(anchor[a0:a1], self.f32), m, proj, iwh)
+            g_tt, base = self._project(f32, self.S(anchor[a0:a1], self.f32),
+                                       m, proj, iwh)
+            ttnn.deallocate(f32)
             Wl = self._weights(f_tt, cam, m, base)
             # h0, w0 and the four bilinear weights, per level, on the Tensix
             # engines -- 8 ms here against the 232 it takes grid_sample's reader
@@ -554,10 +567,14 @@ class TtDFA:
                 ttnn.deallocate(fi); ttnn.deallocate(o)
                 if tot is not so:
                     ttnn.deallocate(so)
-            acc = self.G2T(ttnn.slice(tot, [0, 0], [ml, self.E])).float()
-            proj_out = ttnn.linear(self.S(acc), self.Wo, bias=self.Bo,
+            # tot is already this device's own anchors, so its slice IS what
+            # self.S(acc) used to re-upload. Downloading it only to send it
+            # straight back was two transfers a call for nothing.
+            acc = ttnn.slice(tot, [0, 0], [ml, self.E])
+            proj_out = ttnn.linear(acc, self.Wo, bias=self.Bo,
                                    compute_kernel_config=self.hi)
             out[a0:a1] = self.G2T(ttnn.add(proj_out, f_tt)).float()[:m]
+            ttnn.deallocate(acc)
             for t in (f_tt, g_tt, base, tot, proj_out, *gp, *Wl):
                 ttnn.deallocate(t)
         return out
