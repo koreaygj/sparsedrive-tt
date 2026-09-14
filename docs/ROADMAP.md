@@ -38,7 +38,7 @@ loss stay out of the port.
 2. MHA / FFN / LayerNorm — **done**, 0.99991-0.999998
 3. **DFA** — the body of the project
 4. top-k filter + gather — **done**, 0.999999 / 0.999998 after order alignment
-5. metric heads, score combination, argmax — trivial
+5. metric heads, score combination, argmax — **done**, 0.99988-0.99999
 
 ## DFA on device — where it stands
 
@@ -260,7 +260,38 @@ cameras do not halve. Anchors do; softmax is per-anchor so no `all_reduce` is
 needed, and the feature maps are only 8.4M elements (16.8 MB bf16) to
 replicate.
 
-### 6. Top-k order is not stable across backends — *new, found in Phase 1*
+### 6. The final argmax flips on near-ties — *new, found in Phase 2*
+
+The sharpest form of risk 7 below, and the one that reaches the output. Five
+metric heads score 400 trajectory candidates and argmax picks the one the model
+emits. Measured across the 8 golden frames:
+
+| frame | argmax | 1-2 gap / range |
+|---|---|---|
+| 05d0a1a7 | 3 = 3 | 3.10e-05 |
+| 2930485d | 1 = 1 | 2.56e-03 |
+| 482989b8 | 44 = 44 | 7.95e-05 |
+| 9d626ce2 | 2 = 2 | 1.18e-03 |
+| **a6c24c9c** | **180 vs 20** | **2.25e-06** |
+| bca43253 | 1 = 1 | 2.39e-04 |
+| e5dc48dd | 12 = 12 | 2.10e-03 |
+| f68aaf95 | 52 = 52 | 1.28e-04 |
+
+7 of 8 agree, and the one that does not is exactly the frame with the smallest
+margin. Its head PCC is 0.999916 — unremarkable. It did not flip because the
+arithmetic was poor; it flipped because there was no gap to hold.
+
+This is the model, not the port: 400 candidates drawn from one vocabulary score
+very close together, median relative margin 1.28e-04. fp32 on different
+hardware would flip too, the same way Phase 1's top-k ranking differed between
+CPU and GPU.
+
+A flip is also not obviously a wrong answer — candidates 180 and 20 are
+equivalent by the model's own metric. What it costs is a PDMS question, and
+**Phase 3 should expect end-to-end PDMS to differ from PyTorch for this reason
+rather than from accumulated error.** Measure it before explaining it.
+
+### 7. Top-k order is not stable across backends — *new, found in Phase 1*
 
 Layer 0 keeps the top 128 of 1024 paths and `torch.gather` reorders survivors
 by rank. Between CPU and GPU the selected *set* was identical (128/128) but the
