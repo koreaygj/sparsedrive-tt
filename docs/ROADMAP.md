@@ -35,7 +35,7 @@ loss stay out of the port.
 ## Phase 2 order
 
 1. ResNet-34 + FPN — **done**, 0.9993-0.9998 across the four FPN levels
-2. MHA / FFN / LayerNorm — port existing modules, only token counts differ
+2. MHA / FFN / LayerNorm — **done**, 0.99991-0.999998
 3. **DFA** — the body of the project
 4. top-k filter + gather — **done**, 0.999999 / 0.999998 after order alignment
 5. metric heads, score combination, argmax — trivial
@@ -101,6 +101,21 @@ Worth paying: the softmax already emits the compact layout, so nothing is
 rearranged between softmax and gws, and compact moves a quarter of the traffic
 the 3D form does. `poc_dfa_full.py` validates k up front and names the legal
 values rather than letting TT_FATAL surface from inside the kernel.
+
+### head_dim 32 is the one free alignment in this model
+
+Attention splits 256 channels across 8 heads, so head_dim is 32 -- exactly the
+tile width. The head split is a reshape with no padding.
+
+That is the exception. Everywhere else the natural layout fights the tile grid:
+G = 8 in the DFA wastes 24 of every 32 columns in the [N, CLP, G] form (which
+is why the compact layout exists), and a keypoint's last dimension of 3 would
+waste 29, which is why the projection is fused to keep everything [n, 500].
+
+Attention also scores lower than the FFNs beside it -- 0.99991-0.99995 against
+0.999997 -- for the reason every softmax in this port does: a reduction whose
+length sets the accumulator drift. At 1024 and 384 tokens it is mild; the DFA's
+6000-wide one was not.
 
 ### Conv is a layout problem, not an arithmetic one
 
