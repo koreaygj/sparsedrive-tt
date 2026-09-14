@@ -10,7 +10,7 @@ estimate that was measured is worth more than a clean one that was not.
 |---|---|---|
 | 0 | environment | **done** |
 | 1 | PyTorch reference fixed, golden tensors | **done** — PDMS 92.22 reproduced |
-| 2 | module-by-module PCC port, bottom-up | in progress |
+| 2 | module-by-module PCC port, bottom-up | in progress — DFA middle verified on device |
 | 3 | assembly + navtest evaluation | |
 | 4 | performance | |
 
@@ -39,6 +39,54 @@ loss stay out of the port.
 3. **DFA** — the body of the project
 4. top-k filter + gather — reuse `topk_select` / `row_gather`
 5. metric heads, score combination, argmax — trivial
+
+## DFA on device — where it stands
+
+Graded against `exp/golden_dfa`, the arguments and outputs the CUDA op actually
+saw on a real navtest frame.
+
+| stage | | PCC |
+|---|---|---|
+| kps_generator | not started | |
+| project_points | not started | |
+| `weights_fc` | **done** | 0.999998 |
+| mask + softmax | **done** | 0.999954 |
+| `grid_sample` | **done** | 0.9998 per level |
+| assemble to `[clp, N, E]` | **done**, no host round-trip | |
+| `grouped_weighted_sum` | **done** | 0.999822 |
+| `output_proj` | not started | |
+
+Moving the assembly onto the device took the chunk from 1272 ms to 366 ms, and
+the host side from 439 ms to 12 ms, at the same accuracy.
+
+### Settings that turned out to matter
+
+- **The two softmax matmuls need different fidelity.** gather is bf16 x a 0/1
+  matrix, so fidelity buys nothing — LoFi and HiFi4 measure identical. scatter
+  takes the fp32 denominator as an operand, and fp32 matmul is emulated on
+  Wormhole, so LoFi truncates what the fp32 denominator was for. Row-sum error
+  1.959e-02 -> 5.554e-03 by changing that one config, at no time cost.
+  Carrying the gather's conclusion over to the scatter is what caused it.
+- **`packer_l1_acc` is worth 13x** on the gather (6.176e-02 -> 4.664e-03);
+  `fp32_dest_acc_en` alone only gets 2.830e-01 -> 6.176e-02.
+- **An fp32 output on the denominator matmul is worth another 5x** and costs
+  nothing — the tensor is [n, G]. Widening the *inputs* to fp32 changes nothing.
+- **bf16 grids are the whole of grid_sample's error.** Quantising only the grid
+  reproduces the device numbers to ~5e-6; quantising only the features scores
+  0.999999. Error grows with level width, so the 64x128 level is worst.
+  `ttnn.grid_precompute`'s Q14 grid is the upgrade path if that floor bites.
+- **fp32 grids make grid_sample return NaN.** It is Q14 or bf16.
+
+### Measurement discipline
+
+Three times this session a device time was really JIT compile: 1272 ms that was
+366, 339 ms that was 3.8, 292 ms that was 2.8. Warm every variant before
+timing it, and never compare a fresh config against a cached one.
+
+Likewise, three hypotheses about the row-sum error (axis length, `ttnn.divide`,
+the mask itself) were each wrong, and each took a run to disprove. Pulling out
+every intermediate and diffing stage by stage found it immediately. Decompose
+first.
 
 ## Risks
 
@@ -76,7 +124,7 @@ sparse4D-tt's 57 ms whole-frame budget. Anchors are independent through both
 grid_sample and gws, so the answer is to never materialise it: walk anchors in
 blocks. Measured at 32 anchors/block the buffer is 93.8 MB.
 
-### 2. bf16 accumulator drift scales with clp — *new, found in Phase 2*
+### 2. bf16 accumulator drift scales with the reduction length — *new, found in Phase 2*
 
 Not in the original plan. The gws accumulator is bf16 and sequential, so its
 error grows with the reduction length. Synthetic, N=32, E=256:
@@ -99,8 +147,14 @@ fp32:
 | 4 | 1500 | 0.999507 | 53.2 |
 | 8 | 750 | **0.999746** | 56.2 |
 
-The time is flat because the data volume moved is identical either way, and
-that is what the time is made of. Accuracy here is free.
+The time was flat in that synthetic measurement because host transfers
+dominated it. **Once the assembly moved onto the device and those transfers
+went away, splitting cost 2.4x** — 150 ms at k=1 against 366 ms at k=8, for
+PCC 0.998428 against 0.999822. So it is not free; it is 216 ms for four nines,
+and k=4 or k=2 is worth revisiting in the performance phase.
+
+The same drift sets the floor on the softmax denominator, where the reduction
+is the same 6000: 9.4e-4 over a 2000-long axis, 4.2e-3 over 6000.
 
 ### 3. `weights_fc` intermediate
 
