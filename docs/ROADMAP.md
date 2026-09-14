@@ -37,7 +37,7 @@ loss stay out of the port.
 1. ResNet-34 + FPN — **done**, 0.9993-0.9998 across the four FPN levels
 2. MHA / FFN / LayerNorm — port existing modules, only token counts differ
 3. **DFA** — the body of the project
-4. top-k filter + gather — reuse `topk_select` / `row_gather`
+4. top-k filter + gather — **done**, 0.999999 / 0.999998 after order alignment
 5. metric heads, score combination, argmax — trivial
 
 ## DFA on device — where it stands
@@ -130,6 +130,25 @@ capping the activation block), and both left the error size unchanged to the
 byte. An unchanged error size is the signal that the knob being turned is not
 attached to anything: stop and decompose. An 8x3 conv-by-sharding matrix found
 the culprit in one run, and a 24-point sweep of that one conv found the knob.
+
+### A golden tensor at a module boundary includes what happened between modules
+
+Scoring the top-k gather took three tries, and all three were the reference,
+not the kernel:
+
+    0.326  gathered p_ffn.out -- the FFN branch, before its residual and norm
+    0.881  gathered p_norm2's output, right, but scored against layer 1's DFA
+           input, which is that plus the ego-status encoding layer 1 adds
+    0.999999  status subtracted back out
+
+The tell was there the whole time: `row_gather` takes two sources, and the
+vocabulary gathered by the same indices in the same call held 0.999998 while
+the embedding did not. Two tensors gathered by one index list cannot disagree
+because of the gather. Prefer a reference with a built-in control like that.
+
+PCC has a shape worth reading, too. Wrong tensor entirely reads 0.3; right
+tensor off by one constant row reads 0.88; right tensor reads four nines. 0.88
+means structure is right and an offset is missing, not that precision is poor.
 
 ### Measurement discipline
 
