@@ -11,7 +11,7 @@ estimate that was measured is worth more than a clean one that was not.
 | 0 | environment | **done** |
 | 1 | PyTorch reference fixed, golden tensors | **done** — PDMS 92.22 reproduced |
 | 2 | module-by-module PCC port, bottom-up | in progress — DFA middle verified on device |
-| 3 | assembly + navtest evaluation | |
+| 3 | assembly + navtest evaluation | decoder wired, selects the same trajectory bit-for-bit |
 | 4 | performance | |
 
 ## Why start from sparse4D-tt
