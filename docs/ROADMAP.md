@@ -11,8 +11,27 @@ estimate that was measured is worth more than a clean one that was not.
 | 0 | environment | **done** |
 | 1 | PyTorch reference fixed, golden tensors | **done** — PDMS 92.22 reproduced |
 | 2 | module-by-module PCC port, bottom-up | in progress — DFA middle verified on device |
-| 3 | assembly + navtest evaluation | decoder wired, selects the same trajectory bit-for-bit |
+| 3 | assembly + navtest evaluation | **images to trajectory runs on device, same candidate** |
 | 4 | performance | |
+
+## Where it stands
+
+`model/` holds the port: `resnet34.py`, `fpn.py`, `attention.py`, `dfa.py`,
+`decoder.py`, `sparsedrive.py`. One frame of images produces the same
+trajectory the PyTorch reference does, bit for bit -- the output is a lookup
+from a frozen vocabulary, so equality means the same candidate won out of 400.
+
+    imgs [3,3,256,512] -> ResNet-34 + FPN -> decoder -> trajectory [8,3]
+    1789.8 ms, max|d| 0.000e+00
+
+That timing is not a performance number. Every module boundary still converts
+through torch on the host, and inside the DFA the projected coordinates, the
+visibility mask and the gws partial sums all round-trip. The device-only part
+of the three DFA calls measures 1352 ms of it.
+
+Two things remain before navtest: removing those round-trips, and feeding the
+model from the navsim pipeline rather than from golden tensors -- the
+`$NAVSIM_PY` / `$TT_PY` seam Phase 0 designed but never connected.
 
 ## Why start from sparse4D-tt
 
