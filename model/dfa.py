@@ -21,6 +21,10 @@ short version:
     with the strided per-group sum done as a 0/1 matmul. Its two matmuls need
     different fidelity: the gather is bf16 x 0/1 (fidelity irrelevant), the
     scatter takes the fp32 denominator (LoFi truncates it).
+  - grid_sample gets a PRECOMPUTED grid. Its reader derives h0/w0 and the four
+    bilinear weights in soft float on a core with no FPU, which measured 70% of
+    the op; ttnn.grid_precompute does that on the Tensix engines instead. See
+    _gp_consts for the constant pack it takes.
   - clp is ordered (camera, point, level), not the (camera, level, point) the
     checkpoint emits. The mask is constant over level and group, so that order
     puts it constant over the last L*G = 32 columns -- exactly a tile width --
@@ -48,10 +52,81 @@ def _cast(x, dt):
     return x
 
 
+# grid_precompute's coords tile is 32 columns wide and the reader fills 2*K of
+# them, so a row carries at most 16 points. That is a tile shape, not a model
+# quantity -- a "row" here is just 16 consecutive grid points and may straddle
+# anchors, which nothing downstream can see because grid_sample's K-batched
+# output flattens back to point order.
+GP_K = 16
+Q14_SHIFT = 14                     # must match grid_precompute and grid_sample
+
 FIX_HEIGHT = (0.0, -0.25, -0.5, 0.25, 0.5)
 NUM_LEARNABLE = 2
 LOFI = dict(math_fidelity=ttnn.MathFidelity.LoFi, fp32_dest_acc_en=True, packer_l1_acc=True)
 HIFI = dict(math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, packer_l1_acc=True)
+
+
+def _q14(g):
+    """[-1, 1] grid -> Q14 fixed point in an int16.
+
+    Fixed point rather than bf16 because the coordinate is clamped to [-2, 2],
+    so a float's exponent buys nothing while the bilinear weight it feeds wants
+    uniform absolute precision. Clamping to 2 is safe: a point at |g| = 2 lands
+    at least a whole pixel outside the image on every FPN level, so it stays out
+    of bounds and its four weights stay zero.
+    """
+    return torch.round(g.clamp(-2.0, 2.0) * (1 << Q14_SHIFT)).clamp(-32768, 32767).to(torch.int16)
+
+
+def _gp_consts(shapes, K=GP_K, shift=Q14_SHIFT):
+    """The f32 tile pack grid_precompute reads; ordering is its kernel's contract.
+
+        tile      l           SCALE_l   per-column affine scale, Q14 folded in
+        tile   NL+l           BIAS_l    per-column affine offset
+        tile  2NL+l           C_l       per-column bound, size - 1
+        tile 3NL+5j+{0..4}    SB0 SB1 SH0 SH1 SI   selectors for output tile j
+
+    The coords tile holds the grid row as it sits in memory: column 2k is point
+    k's x, column 2k+1 its y. So the even columns carry width-derived constants
+    and the odd ones height-derived, and the selectors read x from 2k and y from
+    2k+1.
+
+    The kernel computes, per column, P = coords*SCALE + BIAS, F = floor(P),
+    R = P - F, then the two boundary-masked factors FA0 = (1-R)*[0 <= F <= C]
+    and FA1 = R*[0 <= F+1 <= C]. The four bilinear weights factorise into those,
+    which is why four 0/1 selectors suffice:
+
+        out = (FA0 @ SB0 + FA1 @ SB1) * (FA0 @ SH0 + FA1 @ SH1) + F @ SI
+
+    Output fields are FIELD-MAJOR, the layout grid_sample's precomputed reader
+    expects: [h0 x K][w0 x K][nw x K][ne x K][sw x K][se x K]. h0 is a height
+    index so it comes from the y column; w0 from the x column. SI routes them
+    into fields 0 and 1, where both weight factors are zero by construction.
+    """
+    NL, OT = len(shapes), (K * 6 + 31) // 32
+    T = torch.zeros(3 * NL + 5 * OT, 32, 32, dtype=torch.float32)
+    inv = 1.0 / (1 << shift)
+    for l, (H, W) in enumerate(shapes):
+        for c in range(32):
+            S = W if c % 2 == 0 else H
+            T[l, :, c] = (S / 2) * inv             # align_corners=False: g*S/2 + (S-1)/2
+            T[NL + l, :, c] = (S - 1) / 2
+            T[2 * NL + l, :, c] = S - 1
+    for j in range(OT):
+        SB0, SB1, SH0, SH1, SI = (T[3 * NL + 5 * j + i] for i in range(5))
+        for o in range(32):
+            og = j * 32 + o
+            if og >= 6 * K:
+                break
+            f, k = og // K, og % K
+            if f == 0:                             # h0 <- floor of the y column
+                SI[2 * k + 1, o] = 1.0
+            elif f == 1:                           # w0 <- floor of the x column
+                SI[2 * k, o] = 1.0
+            else:                                  # nw ne sw se
+                (SB0 if f in (2, 4) else SB1)[2 * k, o] = 1.0
+                (SH0 if f in (2, 3) else SH1)[2 * k + 1, o] = 1.0
+    return T.reshape(-1, 32).contiguous()
 
 
 def _mask_layout_perm(L, P, G):
@@ -150,6 +225,10 @@ class TtDFA:
         self.Ox, self.Oy = T(Ox, ttnn.float32), T(Oy, ttnn.float32)
         self.Ax, self.Ay = T(Ax, ttnn.float32), T(Ay, ttnn.float32)
         self.zc = torch.tensor([FIX_HEIGHT[(p // Lp) % H] for p in range(P)])
+        # grid_precompute's constant pack, built on first use from the level
+        # shapes the feature tensors carry. It depends on nothing else, so all
+        # three DFA instances would build the same one.
+        self._consts, self._consts_key = None, None
 
     def upload_levels(self, mc_ms_feat, shapes, starts):
         """[1, C, F, E] -> per-level NHWC on device. Once per frame."""
@@ -159,6 +238,15 @@ class TtDFA:
             layout=ttnn.ROW_MAJOR_LAYOUT, device=self.dev, dtype=ttnn.bfloat16,
             mesh_mapper=self.rep)
             for (h, w), s in zip(shapes, starts)]
+
+    def _gp_pack(self, levels_tt):
+        key = tuple((int(t.shape[1]), int(t.shape[2])) for t in levels_tt)
+        if key != self._consts_key:
+            self._consts = ttnn.from_torch(
+                _gp_consts(key), layout=ttnn.TILE_LAYOUT, device=self.dev,
+                dtype=ttnn.float32, mesh_mapper=self.rep)
+            self._consts_key = key
+        return self._consts
 
     def _camera_embed(self, proj):
         ce = self.T(proj[:, :3].reshape(self.C, -1))
@@ -170,22 +258,19 @@ class TtDFA:
                                weight=self.ln_w[1], bias=self.ln_b[1])
 
     def _project(self, feat32, anchor32, n, proj, iwh):
-        """-> (grid on host, in-bounds mask on host).
+        """-> (Q14 grid rows [C, n*P/GP_K, 1, 2*GP_K] on host, in-bounds mask).
 
         The grid round-trips: u and v are computed on device, brought back,
-        stacked, and uploaded again. Profiling puts that upload at 142 ms of
-        DAF[0]'s 1136 (12.5%), so assembling it on device looks like free
-        money. It is not -- measured, that made DAF[0] 1113 -> 1482 ms.
+        stacked, and uploaded again. Assembling it on device instead was
+        measured and lost -- the grid's last dimension is 2, and a TILE tensor
+        pads its last dimension to 32, so building it from [1, n*P, 1, 1]
+        pieces spends 30 of every 32 columns on padding. The round trip moves
+        less than the device assembly wastes.
 
-        The reason is the same tile arithmetic that shapes the rest of this
-        port: the grid's last dimension is 2, and a TILE tensor pads its last
-        dimension to 32, so building it from [1, n*P, 1, 1] pieces and
-        concatenating spends 30 of every 32 columns on padding. The host
-        round-trip moves less than the device assembly wastes.
-
-        Doing this properly needs a kernel that writes the packed layout
-        directly -- which is what sparse4D-tt's ttnn.grid_precompute is for.
-        Left as a round-trip until there is reason to build that.
+        What the round trip costs now is 8 ms of a 324 ms call, because the
+        rows go up as Q14 int16 in groups of GP_K points: 64 bytes a row and
+        half the bytes bf16 would take. Removing it needs ttnn.grid_compact,
+        which produces the kept rows and their flags on device.
         """
         off = ttnn.linear(feat32, self.Wl, bias=self.Bl, compute_kernel_config=self.hi)
         x = ttnn.add(ttnn.matmul(off, self.Ox, compute_kernel_config=self.hi),
@@ -212,7 +297,9 @@ class TtDFA:
             for q in (cx, cy, cz, X, Y, Z):
                 ttnn.deallocate(q)
         ttnn.deallocate(x); ttnn.deallocate(y)
-        return torch.stack(grids, 0).reshape(self.C, n * self.P, 1, 2), torch.stack(inb, 1)
+        g = torch.stack(grids, 0).reshape(self.C, n * self.P, 2)
+        return (_q14(g).reshape(self.C, n * self.P // GP_K, 1, 2 * GP_K).contiguous(),
+                torch.stack(inb, 1))
 
     def _weights(self, feat_tt, cam, n, base):
         """n is the global anchor count; each device holds n // nd of them.
@@ -264,7 +351,10 @@ class TtDFA:
             splits = max(k for k in legal_splits(self.clp) if k <= 10)
         assert splits in legal_splits(self.clp), \
             f"clp {self.clp}: splits must be one of {legal_splits(self.clp)}"
+        assert (self.P * self.nd) % GP_K == 0 or (n * self.P) % (GP_K * self.nd) == 0, \
+            f"P={self.P} x chunk must group into {GP_K}-point grid rows per device"
         cam = self._camera_embed(proj)
+        consts = self._gp_pack(levels_tt)
         out = torch.zeros(n, self.E)
         for a0 in range(0, n, chunk):
             a1 = min(a0 + chunk, n)
@@ -281,26 +371,25 @@ class TtDFA:
             seen = inb.sum(1, keepdim=True) != 0
             base = (~torch.logical_and(~inb, seen)).float().reshape(m, self.C * self.P)
             W = self._weights(f_tt, cam, m, self.S(base))
-            # grid is [C, m*P, 1, 2] with points anchor-major, so sharding dim 1
-            # splits the same anchors that dim 0 of feat did.
-            # Upload wide, reshape on device.
-            #
-            # from_torch costs per row, not per byte. The grid's natural shape
-            # [C, m*P, 1, 2] is two bf16 values per row, which uploads at
-            # 50 MB/s; the same bytes as [C, m*P*2/256, 256] go at 4516 MB/s.
-            # Measured on the layer-0 grid, 5.9 MB: 118.0 ms direct against
-            # 1.2 ms wide plus 6.5 ms for the device-side reshape. The sampled
-            # output is bit-identical -- nothing changes but the row count.
-            #
-            # Shard on dim 1 either way: the wide shape keeps anchor-major
-            # order, so half the rows is still the first half of the anchors.
-            gw = _cast(grid, ttnn.bfloat16).reshape(
-                self.C, m * self.P * 2 // 256, 256).contiguous()
-            g_tt = ttnn.reshape(
-                ttnn.from_torch(gw, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.dev,
-                                dtype=ttnn.bfloat16, mesh_mapper=self.sh1),
-                (self.C, (m // self.nd) * self.P, 1, 2))
+            # grid rows are [C, m*P/GP_K, 1, 2*GP_K] Q14 with points
+            # anchor-major, so sharding dim 1 splits the same anchors that dim
+            # 0 of feat did. 64 bytes a row at last-dim 32; from_torch costs
+            # per row, and the two-wide [C, m*P, 1, 2] shape this replaced
+            # uploaded at 50 MB/s against 740 here.
+            g_tt = ttnn.from_torch(grid.view(torch.uint16), layout=ttnn.ROW_MAJOR_LAYOUT,
+                                   device=self.dev, dtype=ttnn.uint16,
+                                   mesh_mapper=self.sh1)
             ml = m // self.nd
+            # h0, w0 and the four bilinear weights, per level, on the Tensix
+            # engines -- 8 ms here against the 232 it takes grid_sample's reader
+            # to derive the same six values in soft float. The outputs are not
+            # zeroed because grid_precompute writes every row of every one.
+            rows = ml * self.P // GP_K
+            spec = ttnn.TensorSpec(ttnn.Shape([self.C, rows, 1, 6 * GP_K]),
+                                   ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT,
+                                   ttnn.BufferType.DRAM)
+            gp = [ttnn.allocate_tensor_on_device(spec, self.dev) for _ in range(4)]
+            ttnn.grid_precompute(g_tt, consts, gp[0], gp[1], gp[2], gp[3], GP_K)
             per = []
             # clp is (camera, point, level): concat on the level axis with the
             # point axis already outside it. The old (camera, level, point)
@@ -308,8 +397,8 @@ class TtDFA:
             # concatenates four [C*P, 1, ml, E] blocks on dim 1 instead.
             # Measured identical, 123.0 ms against 122.9 -- the reorder is free,
             # and it is what lets the mask expand on device.
-            for fm in levels_tt:
-                s_ = ttnn.grid_sample(fm, g_tt, padding_mode="zeros", align_corners=False)
+            for fm, g in zip(levels_tt, gp):
+                s_ = ttnn.grid_sample(fm, g, use_precomputed_grid=True)
                 per.append(ttnn.reshape(
                     ttnn.permute(ttnn.reshape(s_, (self.C, ml, self.P, self.E)),
                                  (0, 2, 1, 3)),
@@ -329,6 +418,6 @@ class TtDFA:
             proj_out = ttnn.linear(self.S(acc), self.Wo, bias=self.Bo,
                                    compute_kernel_config=self.hi)
             out[a0:a1] = self.G2T(ttnn.add(proj_out, f_tt)).float()[:m]
-            for t in (f_tt, g_tt, feats, W, proj_out):
+            for t in (f_tt, g_tt, feats, W, proj_out, *gp):
                 ttnn.deallocate(t)
         return out
