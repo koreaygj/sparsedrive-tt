@@ -104,16 +104,29 @@ LOFI = dict(math_fidelity=ttnn.MathFidelity.LoFi, fp32_dest_acc_en=True, packer_
 HIFI = dict(math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, packer_l1_acc=True)
 
 
-def _q14(g):
-    """[-1, 1] grid -> Q14 fixed point in an int16.
+def _q14_bits(t):
+    """[0, 1] image coordinate -> the int16 BITS of its Q14 [-1, 1] form, in fp32.
 
     Fixed point rather than bf16 because the coordinate is clamped to [-2, 2],
     so a float's exponent buys nothing while the bilinear weight it feeds wants
     uniform absolute precision. Clamping to 2 is safe: a point at |g| = 2 lands
     at least a whole pixel outside the image on every FPN level, so it stays out
     of bounds and its four weights stay zero.
+
+    The clamp happens TWICE on purpose. Once on the coordinate, for the above;
+    and once after scaling, because 2.0 * 2**14 is 32768 -- one past int16, and
+    it wraps to -32768 if left alone. That one boundary was 16% of the points
+    wrong, and every wrong point was a far-out-of-bounds one landing back
+    inside the image.
+
+    The result stays fp32 so the reshapes and concatenations that shape it can
+    accept it: ttnn's reshape refuses uint16. The typecast is the last step.
     """
-    return torch.round(g.clamp(-2.0, 2.0) * (1 << Q14_SHIFT)).clamp(-32768, 32767).to(torch.int16)
+    g = ttnn.clamp(ttnn.subtract(ttnn.multiply(t, 2.0), 1.0), -2.0, 2.0)
+    q = ttnn.clamp(ttnn.round(ttnn.multiply(g, float(1 << Q14_SHIFT))), -32768.0, 32767.0)
+    r = ttnn.where(ttnn.ltz(q), ttnn.add(q, 65536.0), q)      # two's complement bits
+    ttnn.deallocate(g); ttnn.deallocate(q)
+    return r
 
 
 def _gp_consts(shapes, K=GP_K, shift=Q14_SHIFT):
@@ -124,10 +137,17 @@ def _gp_consts(shapes, K=GP_K, shift=Q14_SHIFT):
         tile  2NL+l           C_l       per-column bound, size - 1
         tile 3NL+5j+{0..4}    SB0 SB1 SH0 SH1 SI   selectors for output tile j
 
-    The coords tile holds the grid row as it sits in memory: column 2k is point
-    k's x, column 2k+1 its y. So the even columns carry width-derived constants
-    and the odd ones height-derived, and the selectors read x from 2k and y from
-    2k+1.
+    The coords tile holds the grid row as it sits in memory. This port writes a
+    row BLOCK-WISE -- columns 0..K-1 are the K x coordinates, K..2K-1 the y --
+    rather than interleaved as x,y pairs. Nothing in the op cares, because the
+    reader copies row column c into tile column c and everything after that is
+    these constants; and the block form is what lets the grid be built on
+    device, where u and v arrive as two separate [P, ml] tensors and pairing
+    them up would mean interleaving 2-byte values.
+
+    So the first K columns carry width-derived constants, the last K
+    height-derived, and the selectors read point k's x from column k and its y
+    from column K+k.
 
     The kernel computes, per column, P = coords*SCALE + BIAS, F = floor(P),
     R = P - F, then the two boundary-masked factors FA0 = (1-R)*[0 <= F <= C]
@@ -146,7 +166,7 @@ def _gp_consts(shapes, K=GP_K, shift=Q14_SHIFT):
     inv = 1.0 / (1 << shift)
     for l, (H, W) in enumerate(shapes):
         for c in range(32):
-            S = W if c % 2 == 0 else H
+            S = W if c < K else H
             T[l, :, c] = (S / 2) * inv             # align_corners=False: g*S/2 + (S-1)/2
             T[NL + l, :, c] = (S - 1) / 2
             T[2 * NL + l, :, c] = S - 1
@@ -158,12 +178,12 @@ def _gp_consts(shapes, K=GP_K, shift=Q14_SHIFT):
                 break
             f, k = og // K, og % K
             if f == 0:                             # h0 <- floor of the y column
-                SI[2 * k + 1, o] = 1.0
+                SI[K + k, o] = 1.0
             elif f == 1:                           # w0 <- floor of the x column
-                SI[2 * k, o] = 1.0
+                SI[k, o] = 1.0
             else:                                  # nw ne sw se
-                (SB0 if f in (2, 4) else SB1)[2 * k, o] = 1.0
-                (SH0 if f in (2, 3) else SH1)[2 * k + 1, o] = 1.0
+                (SB0 if f in (2, 4) else SB1)[k, o] = 1.0
+                (SH0 if f in (2, 3) else SH1)[K + k, o] = 1.0
     return T.reshape(-1, 32).contiguous()
 
 
@@ -280,27 +300,30 @@ class TtDFA:
                                weight=self.ln_w[1], bias=self.ln_b[1])
 
     def _project(self, feat32, anchor32, n, proj, iwh):
-        """-> (Q14 grid rows [C, n*P/GP_K, 1, 2*GP_K] on host, in-bounds mask).
+        """-> (Q14 grid [C, P*ml/GP_K, 1, 2*GP_K] uint16, mask base [ml, C*P]).
 
-        The grid round-trips: u and v are computed on device, brought back,
-        stacked, and uploaded again. Assembling it on device instead was
-        measured and lost -- the grid's last dimension is 2, and a TILE tensor
-        pads its last dimension to 32, so building it from [1, n*P, 1, 1]
-        pieces spends 30 of every 32 columns on padding. The round trip moves
-        less than the device assembly wastes.
+        Both are built on device. u and v used to come back to the host, be
+        stacked into a grid, converted to Q14 and uploaded again; measured on
+        DAF[0] that round trip was 21.5 ms of the stage's 25.8, against 4.3 ms
+        of actual projection arithmetic. On device it is 5.8 ms and the bytes
+        are identical -- 0 of 3,072,000 grid values differ, and 0 of 1,536,000
+        mask values.
 
-        What the round trip costs now is 8 ms of a 324 ms call, because the
-        rows go up as Q14 int16 in groups of GP_K points: 64 bytes a row and
-        half the bytes bf16 would take. Removing it needs ttnn.grid_compact,
-        which produces the kept rows and their flags on device.
+        An earlier attempt at this lost badly (DAF[0] 1113 -> 1482 ms) and the
+        reason was tile padding: it assembled a grid whose last dimension was
+        2, and a TILE tensor pads that to 32. Nothing here is ever 2 wide. The
+        coordinates stay [P, ml] until the last moment, the row is formed by
+        one concatenation of two 16-wide blocks in ROW_MAJOR, where there is no
+        padding at all, and the conversion to uint16 happens once at the end.
         """
+        ml = n // self.nd
         off = ttnn.linear(feat32, self.Wl, bias=self.Bl, compute_kernel_config=self.hi)
         x = ttnn.add(ttnn.matmul(off, self.Ox, compute_kernel_config=self.hi),
                      ttnn.matmul(anchor32, self.Ax, compute_kernel_config=self.hi))
         y = ttnn.add(ttnn.matmul(off, self.Oy, compute_kernel_config=self.hi),
                      ttnn.matmul(anchor32, self.Ay, compute_kernel_config=self.hi))
         ttnn.deallocate(off)
-        grids, inb = [], []
+        us, vs = [], []
         for c in range(self.C):
             Pm = proj[c]
             cst = (Pm[:3, 2] * self.zc.unsqueeze(-1) + Pm[:3, 3]).t()
@@ -312,30 +335,77 @@ class TtDFA:
             Z = ttnn.clamp(ttnn.add(ttnn.add(ttnn.multiply(x, float(Pm[2, 0])),
                                              ttnn.multiply(y, float(Pm[2, 1]))), cz),
                            1e-5, 1e30)
-            u = self.G2T(ttnn.multiply(ttnn.divide(X, Z), 1.0 / float(iwh[c, 0]))).float()
-            v = self.G2T(ttnn.multiply(ttnn.divide(Y, Z), 1.0 / float(iwh[c, 1]))).float()
-            grids.append(torch.stack([u * 2 - 1, v * 2 - 1], -1))
-            inb.append((u > 0) & (u < 1) & (v > 0) & (v < 1))
+            us.append(ttnn.multiply(ttnn.divide(X, Z), 1.0 / float(iwh[c, 0])))
+            vs.append(ttnn.multiply(ttnn.divide(Y, Z), 1.0 / float(iwh[c, 1])))
             for q in (cx, cy, cz, X, Y, Z):
                 ttnn.deallocate(q)
         ttnn.deallocate(x); ttnn.deallocate(y)
-        # POINT-MAJOR, per device. grid_sample emits one output row per grid
-        # row, so the grid's point order IS the output's axis order: laying the
-        # points out (point, anchor) makes it hand back [C, P, ml, E], which is
-        # what grouped_weighted_sum wants. The anchor-major order it replaces
-        # needed a permute of the whole 1.46 GiB feature tensor to get there --
-        # 35.7 ms a chip, more than grid_sample itself cost.
-        #
-        # The transpose has to happen INSIDE each device's anchor block, not
-        # across the whole grid: ShardTensorToMesh splits dim 1 into nd equal
-        # runs, and an anchor must keep all of its points on the device that
-        # holds its features. So the host lays out nd point-major blocks back
-        # to back and the sharding cuts between them.
-        ml = n // self.nd
-        g = torch.stack(grids, 0).reshape(self.C, self.nd, ml, self.P, 2)
-        g = g.permute(0, 1, 3, 2, 4).reshape(self.C, self.nd * self.P * ml, 2)
-        return (_q14(g).contiguous().reshape(self.C, n * self.P // GP_K, 1, 2 * GP_K),
-                torch.stack(inb, 1))
+
+        # --- the grid ------------------------------------------------------
+        # POINT-MAJOR: grid_sample emits one output row per grid row, so the
+        # point order IS the feature tensor's axis order, and this one hands
+        # back [C, P, ml, E] -- what gws wants, with no permute. The transpose
+        # that gets there is on a [ml, P] fp32 tensor, 0.06 ms, not on the
+        # 1.46 GiB of sampled features it replaces.
+        # All six coordinate planes go through the Q14 chain and the transpose
+        # as ONE tensor. These are small -- [ml, P] fp32, about a megabyte --
+        # so the chain is launch-bound, not bandwidth-bound, and doing it per
+        # camera meant 54 dispatches where this needs 26. It cost DAF[2], whose
+        # planes are [200, 80], more than the round trip it replaced.
+        uv = ttnn.concat(us + vs, dim=0)                      # [2*C*ml, P]
+        q = _q14_bits(uv)
+        t16 = ttnn.to_layout(ttnn.transpose(q, 0, 1), ttnn.ROW_MAJOR_LAYOUT)  # [P, 2*C*ml]
+        ttnn.deallocate(uv); ttnn.deallocate(q)
+        # A row is GP_K consecutive points of the point-major [P, ml] plane, and
+        # it may straddle a point index when ml is not a multiple of GP_K --
+        # DAF[2] on a mesh has ml = 200. Nothing downstream can tell: a row is
+        # only ever a unit of 16 points to grid_precompute, and grid_sample's
+        # K-batched output flattens back to the same order either way. What has
+        # to divide is P*ml, which is the whole plane.
+        rows_c = self.P * ml // GP_K
+        blocks = []
+        for c in range(self.C):
+            su = ttnn.slice(t16, [0, c * ml], [self.P, (c + 1) * ml])
+            sv = ttnn.slice(t16, [0, (self.C + c) * ml], [self.P, (self.C + c + 1) * ml])
+            ru = ttnn.reshape(su, (rows_c, GP_K))
+            rv = ttnn.reshape(sv, (rows_c, GP_K))
+            blocks.append(ttnn.concat([ru, rv], dim=-1))      # [rows_c, 2*GP_K]
+            for t in (su, sv, ru, rv):
+                ttnn.deallocate(t)
+        ttnn.deallocate(t16)
+        g = ttnn.concat(blocks, dim=0)                        # [C*rows_c, 2*GP_K]
+        g4 = ttnn.reshape(g, (self.C, rows_c, 1, 2 * GP_K))
+        g_tt = ttnn.typecast(g4, ttnn.uint16)
+        for t in blocks:
+            ttnn.deallocate(t)
+        ttnn.deallocate(g); ttnn.deallocate(g4)
+
+        # --- the mask base -------------------------------------------------
+        # A camera is silenced at a point only where another camera sees it,
+        # which is also what keeps the softmax denominator non-zero. The
+        # concatenation is in ROW_MAJOR because P = 500 is not a multiple of
+        # the tile width, so three [ml, 500] TILE tensors would concatenate to
+        # 1536 columns, not 1500.
+        ib = []
+        for c in range(self.C):
+            a = ttnn.logical_and(ttnn.gtz(us[c]), ttnn.ltz(ttnn.subtract(us[c], 1.0)))
+            b = ttnn.logical_and(ttnn.gtz(vs[c]), ttnn.ltz(ttnn.subtract(vs[c], 1.0)))
+            ib.append(ttnn.logical_and(a, b))
+            ttnn.deallocate(a); ttnn.deallocate(b)
+        seen = ib[0]
+        for c in range(1, self.C):
+            nxt = ttnn.logical_or(seen, ib[c])
+            if seen is not ib[0]:
+                ttnn.deallocate(seen)
+            seen = nxt
+        blind = ttnn.logical_not(seen)
+        keep = [ttnn.to_layout(ttnn.logical_or(ib[c], blind), ttnn.ROW_MAJOR_LAYOUT)
+                for c in range(self.C)]
+        base = ttnn.typecast(
+            ttnn.to_layout(ttnn.concat(keep, dim=-1), ttnn.TILE_LAYOUT), ttnn.bfloat16)
+        for t in ib + keep + [blind] + ([seen] if seen is not ib[0] else []) + us + vs:
+            ttnn.deallocate(t)
+        return g_tt, base
 
     def _expand_mask(self, base, nl):
         """[nl, C*P] -> [nl, clp*G], the mask in (camera, level, point, group).
@@ -428,8 +498,10 @@ class TtDFA:
         assert splits in (None, 1), (
             "the clp reduction is no longer sliced here; grouped_weighted_sum's "
             "num_chunks does that, and gws runs once per level. See GWS_CHUNKS.")
-        assert (self.P * self.nd) % GP_K == 0 or (n * self.P) % (GP_K * self.nd) == 0, \
-            f"P={self.P} x chunk must group into {GP_K}-point grid rows per device"
+        assert (self.P * (chunk // self.nd)) % GP_K == 0 and \
+               (self.P * ((n % chunk or chunk) // self.nd)) % GP_K == 0, (
+            f"P={self.P}: a device's plane P*(chunk/nd) must divide into "
+            f"{GP_K}-point grid rows")
         cam = self._camera_embed(proj)
         consts = self._gp_pack(levels_tt)
         out = torch.zeros(n, self.E)
@@ -439,24 +511,13 @@ class TtDFA:
             assert m % self.nd == 0, (
                 f"chunk {m} must divide across {self.nd} devices; "
                 f"pick a chunk that divides {n} into multiples of {self.nd}")
-            f_tt = self.S(feat[a0:a1])
-            grid, inb = self._project(self.S(feat[a0:a1], self.f32),
-                                      self.S(anchor[a0:a1], self.f32), m, proj, iwh)
-            # [m, C, P] -- the (camera, point) mask, unexpanded. The
-            # expansion to [m, clp*G] is a device repeat_interleave inside
-            # _weights: 94 MB of transfer becomes 1.5 MB. inb is [m, C, P].
-            seen = inb.sum(1, keepdim=True) != 0
-            base = (~torch.logical_and(~inb, seen)).float().reshape(m, self.C * self.P)
-            Wl = self._weights(f_tt, cam, m, self.S(base))
-            # grid rows are [C, m*P/GP_K, 1, 2*GP_K] Q14 with points
-            # anchor-major, so sharding dim 1 splits the same anchors that dim
-            # 0 of feat did. 64 bytes a row at last-dim 32; from_torch costs
-            # per row, and the two-wide [C, m*P, 1, 2] shape this replaced
-            # uploaded at 50 MB/s against 740 here.
-            g_tt = ttnn.from_torch(grid.view(torch.uint16), layout=ttnn.ROW_MAJOR_LAYOUT,
-                                   device=self.dev, dtype=ttnn.uint16,
-                                   mesh_mapper=self.sh1)
             ml = m // self.nd
+            f_tt = self.S(feat[a0:a1])
+            # Nothing comes back to the host here: both the Q14 grid and the
+            # [ml, C*P] mask are built on device from u and v.
+            g_tt, base = self._project(self.S(feat[a0:a1], self.f32),
+                                       self.S(anchor[a0:a1], self.f32), m, proj, iwh)
+            Wl = self._weights(f_tt, cam, m, base)
             # h0, w0 and the four bilinear weights, per level, on the Tensix
             # engines -- 8 ms here against the 232 it takes grid_sample's reader
             # to derive the same six values in soft float. The outputs are not
@@ -497,6 +558,6 @@ class TtDFA:
             proj_out = ttnn.linear(self.S(acc), self.Wo, bias=self.Bo,
                                    compute_kernel_config=self.hi)
             out[a0:a1] = self.G2T(ttnn.add(proj_out, f_tt)).float()[:m]
-            for t in (f_tt, g_tt, tot, proj_out, *gp, *Wl):
+            for t in (f_tt, g_tt, base, tot, proj_out, *gp, *Wl):
                 ttnn.deallocate(t)
         return out
