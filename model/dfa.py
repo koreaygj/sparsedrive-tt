@@ -25,15 +25,16 @@ short version:
     bilinear weights in soft float on a core with no FPU, which measured 70% of
     the op; ttnn.grid_precompute does that on the Tensix engines instead. See
     _gp_consts for the constant pack it takes.
-  - clp is ordered (camera, point, level), not the (camera, level, point) the
-    checkpoint emits. The mask is constant over level and group, so that order
-    puts it constant over the last L*G = 32 columns -- exactly a tile width --
-    and one repeat_interleave builds it on device. See _mask_layout_perm.
+  - clp keeps the checkpoint's own (camera, level, point) order, because that
+    is the one order whose level blocks are contiguous -- which is what lets
+    grouped_weighted_sum run once per FPN level, straight off the grid_sample
+    output, with no concatenated [clp, n, E] tensor in between.
   - the mask silences a camera only where another camera sees the point, which
     is also what keeps the denominator non-zero.
   - the clp reduction is NOT sliced. grouped_weighted_sum's own num_chunks
     splits it instead, which bounds the bf16 accumulator the same way while
-    also being what fills the device -- see GWS_CHUNKS.
+    also being what fills the device -- see GWS_CHUNKS. num_chunks MUST divide
+    the reduction exactly or the op hangs; the op now refuses it instead.
   - features never exist whole -- 2.93 GiB at layer 0 -- so anchors are walked
     in blocks, and the clp reduction is split to bound the bf16 accumulator.
 """
@@ -166,29 +167,6 @@ def _gp_consts(shapes, K=GP_K, shift=Q14_SHIFT):
     return T.reshape(-1, 32).contiguous()
 
 
-def _mask_layout_perm(L, P, G):
-    """Reorder one camera's weights_fc outputs from (level, point, group) to
-    (point, level, group).
-
-    The mask depends on camera and point only, never on level or group. Under
-    the checkpoint's (l, p, g) order it therefore repeats along two axes at
-    once -- stride P*G for the level and stride 1 for the group -- and no stock
-    op expands it cheaply: repeat_interleave by G=8 is sub-tile, and tiling the
-    result L times concatenates 94 MB four times. Measured 80.8 ms, against
-    58.6 ms to build the same thing on the host and ship it.
-
-    Under (p, l, g) the mask is constant over the trailing L*G = 32 columns,
-    which is one tile wide, so a single repeat_interleave(32) is a tile-aligned
-    copy: 3.7 ms, plus 0.8 ms to upload the [n, C*P] base it expands from.
-
-    Nothing numeric changes. This permutes the rows of weights_fc's weight and
-    bias once at load, and `features` is assembled in the matching order, so
-    grouped_weighted_sum sees the same (weight, feature) pairs it saw before --
-    it only sums over clp, so the order within clp never mattered to it.
-    """
-    return torch.arange(L * P * G).reshape(L, P, G).permute(1, 0, 2).reshape(-1)
-
-
 def legal_splits(clp, G=8):
     """clp splits the COMPACT weight layout accepts: (clp/k)*G tile-aligned."""
     return [k for k in range(1, 33) if clp % k == 0 and (clp // k) * G % 32 == 0]
@@ -231,13 +209,12 @@ class TtDFA:
 
         self.Wl = T(g("kps_generator.learnable_fc.weight").t(), ttnn.float32)
         self.Bl = T(g("kps_generator.learnable_fc.bias").reshape(1, -1), ttnn.float32)
-        # (l, p, g) -> (p, l, g); see _mask_layout_perm.
-        self.LG = num_levels * num_groups
-        assert self.LG % 32 == 0, (
-            f"the mask expansion wants num_levels*num_groups tile-aligned, got {self.LG}")
-        wp = _mask_layout_perm(num_levels, self.P, num_groups)
-        self.Wf = T(g("weights_fc.weight")[wp].t())
-        self.Bf = T(g("weights_fc.bias")[wp].reshape(1, -1))
+        # No permutation: weights_fc already emits (level, point, group) within
+        # a camera, and the camera axis comes from how the linear's rows are
+        # grouped, so the full order is (camera, level, point, group).
+        self.PG = self.P * num_groups
+        self.Wf = T(g("weights_fc.weight").t())
+        self.Bf = T(g("weights_fc.bias").reshape(1, -1))
         self.Wo = T(g("output_proj.weight").t())
         self.Bo = T(g("output_proj.bias").reshape(1, -1))
         self.ce_w = [T(g(f"camera_encoder.{i}.weight").t()) for i in (0, 3)]
@@ -266,10 +243,14 @@ class TtDFA:
         # shapes the feature tensors carry. It depends on nothing else, so all
         # three DFA instances would build the same one.
         self._consts, self._consts_key = None, None
-        # num_chunks must divide clp exactly -- the reader hands the compute
+        # gws runs per level, so its reduction is one level's worth of clp.
+        # num_chunks must divide that exactly -- the reader hands the compute
         # kernel a fixed page count per work unit, and a ragged last chunk
-        # leaves it waiting for pages that never come.
-        self.nchunks = max(k for k in (GWS_CHUNKS, 8, 4, 2, 1) if self.clp % k == 0)
+        # leaves it waiting for pages that never come. The op refuses a ragged
+        # split rather than hanging, but pick a divisor here anyway.
+        self.clp_l = num_cams * self.P
+        self.nchunks = max(k for k in (GWS_CHUNKS, 25, 20, 15, 12, 10, 8, 6, 5, 4, 3, 2, 1)
+                           if self.clp_l % k == 0)
 
     def upload_levels(self, mc_ms_feat, shapes, starts):
         """[1, C, F, E] -> per-level NHWC on device. Once per frame."""
@@ -342,11 +323,44 @@ class TtDFA:
         return (_q14(g).reshape(self.C, n * self.P // GP_K, 1, 2 * GP_K).contiguous(),
                 torch.stack(inb, 1))
 
+    def _expand_mask(self, base, nl):
+        """[nl, C*P] -> [nl, clp*G], the mask in (camera, level, point, group).
+
+        It has to repeat along two axes -- level at stride P*G and group at
+        stride 1 -- which is the shape that made an early attempt at this cost
+        80.8 ms. It is cheap here only because both repeats land on tile
+        boundaries: the group repeat is a plain interleave on the last axis,
+        and a camera block is P*G = 4000 columns, 125 whole tiles, so tiling it
+        L times is an aligned slice-and-concatenate.
+
+            repeat_interleave(G) -> (c, p, g)      0.8 ms
+            slice into C camera blocks             0.4 ms
+            concat the L copies of each            0.9 ms
+                                                   1.4 ms, exact
+        """
+        b8 = ttnn.repeat_interleave(base, self.G, dim=-1)
+        cams = [ttnn.slice(b8, [0, c * self.PG], [nl, (c + 1) * self.PG])
+                for c in range(self.C)]
+        keep = ttnn.concat([cams[c] for c in range(self.C) for _ in range(self.L)], dim=-1)
+        ttnn.deallocate(b8)
+        for t in cams:
+            ttnn.deallocate(t)
+        return keep
+
     def _weights(self, feat_tt, cam, n, base):
         """n is the global anchor count; each device holds n // nd of them.
 
         `base` is the mask at [n, C*P], one value per (camera, point); the
         expansion to the full [n, clp*G] happens here, on device.
+
+        Returns ONE TENSOR PER LEVEL, [nl, C*P*G] in (camera, point, group),
+        matching what grid_sample emits for that level. The softmax still runs
+        across the whole clp -- it has to, the denominator spans every camera
+        and level -- and only its result is regrouped. clp is
+        (camera, level, point, group), so level l is the C blocks at
+        (c*L + l) * P*G, each P*G wide and so tile-aligned: 1.3 ms for all
+        twelve slices and four concatenations, against the 27.0 ms concat of
+        the feature tensor it replaces.
         """
         nl = n // self.nd
         fx = ttnn.add(ttnn.reshape(feat_tt, (nl, 1, self.E)),
@@ -354,7 +368,7 @@ class TtDFA:
         wl = ttnn.linear(ttnn.reshape(fx, (nl * self.C, self.E)), self.Wf, bias=self.Bf,
                          compute_kernel_config=self.hi)
         logits = ttnn.reshape(wl, (nl, self.wide))
-        keep = ttnn.repeat_interleave(base, self.LG, dim=-1)
+        keep = self._expand_mask(base, nl)
         mx = ttnn.max(logits, dim=-1, keepdim=True)
         e = ttnn.multiply(ttnn.exp(ttnn.subtract(logits, mx)), keep)
         ttnn.deallocate(keep)
@@ -363,7 +377,16 @@ class TtDFA:
         ttnn.deallocate(s)
         w = ttnn.divide(e, sb)
         ttnn.deallocate(e); ttnn.deallocate(sb)
-        return w
+        per = []
+        for l in range(self.L):
+            parts = [ttnn.slice(w, [0, (c * self.L + l) * self.PG],
+                                [nl, (c * self.L + l + 1) * self.PG])
+                     for c in range(self.C)]
+            per.append(ttnn.concat(parts, dim=-1))
+            for t in parts:
+                ttnn.deallocate(t)
+        ttnn.deallocate(w)
+        return per
 
     def __call__(self, feat, anchor, levels_tt, proj, iwh, chunk=1024, splits=None):
         """feat [n, E] torch, anchor [n, num_sample*2] torch. -> [n, E] torch.
@@ -388,10 +411,9 @@ class TtDFA:
         mesh), so this is the end of the free lunch.
         """
         n = feat.shape[0]
-        if splits is None:
-            splits = 1
-        assert splits in legal_splits(self.clp), \
-            f"clp {self.clp}: splits must be one of {legal_splits(self.clp)}"
+        assert splits in (None, 1), (
+            "the clp reduction is no longer sliced here; grouped_weighted_sum's "
+            "num_chunks does that, and gws runs once per level. See GWS_CHUNKS.")
         assert (self.P * self.nd) % GP_K == 0 or (n * self.P) % (GP_K * self.nd) == 0, \
             f"P={self.P} x chunk must group into {GP_K}-point grid rows per device"
         cam = self._camera_embed(proj)
@@ -411,7 +433,7 @@ class TtDFA:
             # _weights: 94 MB of transfer becomes 1.5 MB. inb is [m, C, P].
             seen = inb.sum(1, keepdim=True) != 0
             base = (~torch.logical_and(~inb, seen)).float().reshape(m, self.C * self.P)
-            W = self._weights(f_tt, cam, m, self.S(base))
+            Wl = self._weights(f_tt, cam, m, self.S(base))
             # grid rows are [C, m*P/GP_K, 1, 2*GP_K] Q14 with points
             # anchor-major, so sharding dim 1 splits the same anchors that dim
             # 0 of feat did. 64 bytes a row at last-dim 32; from_torch costs
@@ -431,44 +453,37 @@ class TtDFA:
                                    ttnn.BufferType.DRAM)
             gp = [ttnn.allocate_tensor_on_device(spec, self.dev) for _ in range(4)]
             ttnn.grid_precompute(g_tt, consts, gp[0], gp[1], gp[2], gp[3], GP_K)
-            per = []
-            # clp is (camera, point, level): concat on the level axis with the
-            # point axis already outside it. The old (camera, level, point)
-            # order concatenated four [C, P, ml, E] blocks on dim 1; this
-            # concatenates four [C*P, 1, ml, E] blocks on dim 1 instead.
-            # Measured identical, 123.0 ms against 122.9 -- the reorder is free,
-            # and it is what lets the mask expand on device.
-            for fm, g in zip(levels_tt, gp):
-                s_ = ttnn.grid_sample(fm, g, use_precomputed_grid=True)
-                per.append(ttnn.reshape(
-                    ttnn.permute(ttnn.reshape(s_, (self.C, ml, self.P, self.E)),
-                                 (0, 2, 1, 3)),
-                    (self.C * self.P, 1, ml, self.E)))
-            feats = ttnn.reshape(ttnn.concat(per, dim=1), (self.clp, ml, self.E))
-            # splits defaults to 1: slicing the reduction cost a full copy of
-            # feats -- 1.46 GiB a chip, 26.8 ms -- and bought only the shorter
-            # bf16 accumulation that num_chunks now gives for nothing.
-            sl = self.clp // splits
+            # One grouped_weighted_sum per FPN level, straight off what
+            # grid_sample produced for it. There is no [clp, ml, E] tensor:
+            # building one cost a 1.46 GiB concatenation, 27.0 ms a chip, and
+            # four calls measured 22.0 ms against one call's 22.6. The whole
+            # point of keeping clp in (camera, level, point) order is that a
+            # level's weights are then contiguous.
+            #
+            # The partial sums of all four levels add up before coming back, so
+            # the host sees one [ml, E] download instead of four.
             mp_ = ((ml + 31) // 32) * 32
             nc = self.nchunks
-            acc = torch.zeros(m, self.E)
-            for i in range(splits):
-                fi = feats if splits == 1 else \
-                    ttnn.slice(feats, [i * sl, 0, 0], [(i + 1) * sl, ml, self.E])
-                wi = W if splits == 1 else \
-                    ttnn.slice(W, [0, i * sl * self.G], [ml, (i + 1) * sl * self.G])
+            tot = None
+            for fm, g, wi in zip(levels_tt, gp, Wl):
+                s_ = ttnn.grid_sample(fm, g, use_precomputed_grid=True)
+                fi = ttnn.reshape(
+                    ttnn.permute(ttnn.reshape(s_, (self.C, ml, self.P, self.E)),
+                                 (0, 2, 1, 3)),
+                    (self.C * self.P, ml, self.E))
                 o = ttnn.grouped_weighted_sum(fi, wi, num_groups=self.G,
                                               group_dims=self.E // self.G, num_chunks=nc)
                 # o is [nc * mp_, E], one block per partial sum.
-                so = ttnn.sum(ttnn.reshape(o, (nc, mp_, self.E)), dim=0)
-                acc += self.G2T(ttnn.slice(ttnn.reshape(so, (mp_, self.E)),
-                                           [0, 0], [ml, self.E])).float()
-                if splits != 1:
-                    ttnn.deallocate(fi); ttnn.deallocate(wi)
-                ttnn.deallocate(o); ttnn.deallocate(so)
+                so = ttnn.reshape(ttnn.sum(ttnn.reshape(o, (nc, mp_, self.E)), dim=0),
+                                  (mp_, self.E))
+                tot = so if tot is None else ttnn.add(tot, so)
+                ttnn.deallocate(fi); ttnn.deallocate(o)
+                if tot is not so:
+                    ttnn.deallocate(so)
+            acc = self.G2T(ttnn.slice(tot, [0, 0], [ml, self.E])).float()
             proj_out = ttnn.linear(self.S(acc), self.Wo, bias=self.Bo,
                                    compute_kernel_config=self.hi)
             out[a0:a1] = self.G2T(ttnn.add(proj_out, f_tt)).float()[:m]
-            for t in (f_tt, g_tt, feats, W, proj_out, *gp):
+            for t in (f_tt, g_tt, tot, proj_out, *gp, *Wl):
                 ttnn.deallocate(t)
         return out
