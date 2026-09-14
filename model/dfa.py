@@ -319,8 +319,22 @@ class TtDFA:
             for q in (cx, cy, cz, X, Y, Z):
                 ttnn.deallocate(q)
         ttnn.deallocate(x); ttnn.deallocate(y)
-        g = torch.stack(grids, 0).reshape(self.C, n * self.P, 2)
-        return (_q14(g).reshape(self.C, n * self.P // GP_K, 1, 2 * GP_K).contiguous(),
+        # POINT-MAJOR, per device. grid_sample emits one output row per grid
+        # row, so the grid's point order IS the output's axis order: laying the
+        # points out (point, anchor) makes it hand back [C, P, ml, E], which is
+        # what grouped_weighted_sum wants. The anchor-major order it replaces
+        # needed a permute of the whole 1.46 GiB feature tensor to get there --
+        # 35.7 ms a chip, more than grid_sample itself cost.
+        #
+        # The transpose has to happen INSIDE each device's anchor block, not
+        # across the whole grid: ShardTensorToMesh splits dim 1 into nd equal
+        # runs, and an anchor must keep all of its points on the device that
+        # holds its features. So the host lays out nd point-major blocks back
+        # to back and the sharding cuts between them.
+        ml = n // self.nd
+        g = torch.stack(grids, 0).reshape(self.C, self.nd, ml, self.P, 2)
+        g = g.permute(0, 1, 3, 2, 4).reshape(self.C, self.nd * self.P * ml, 2)
+        return (_q14(g).contiguous().reshape(self.C, n * self.P // GP_K, 1, 2 * GP_K),
                 torch.stack(inb, 1))
 
     def _expand_mask(self, base, nl):
@@ -466,11 +480,10 @@ class TtDFA:
             nc = self.nchunks
             tot = None
             for fm, g, wi in zip(levels_tt, gp, Wl):
+                # The grid is point-major, so this is already [C, P, ml, E] and
+                # the reshape is free -- see _project.
                 s_ = ttnn.grid_sample(fm, g, use_precomputed_grid=True)
-                fi = ttnn.reshape(
-                    ttnn.permute(ttnn.reshape(s_, (self.C, ml, self.P, self.E)),
-                                 (0, 2, 1, 3)),
-                    (self.C * self.P, ml, self.E))
+                fi = ttnn.reshape(s_, (self.C * self.P, ml, self.E))
                 o = ttnn.grouped_weighted_sum(fi, wi, num_groups=self.G,
                                               group_dims=self.E // self.G, num_chunks=nc)
                 # o is [nc * mp_, E], one block per partial sum.
