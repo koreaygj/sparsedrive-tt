@@ -221,6 +221,50 @@ PCC has a shape worth reading, too. Wrong tensor entirely reads 0.3; right
 tensor off by one constant row reads 0.88; right tensor reads four nines. 0.88
 means structure is right and an offset is missing, not that precision is poor.
 
+### from_torch costs per row, not per byte
+
+The single most expensive thing in the frame was uploading a 5.9 MB tensor.
+
+    shape                   MB    ROW_MAJOR   TILE
+    (1, 1, 2097152, 2)     8.0     50 MB/s    90 MB/s
+    (1024, 48000)         93.8   9131 MB/s  2493 MB/s
+    (12000, 256)           5.9   4516 MB/s  5519 MB/s
+
+Same bytes, 90x apart. A last dimension of 2 means two million rows; a last
+dimension of 256 means twelve thousand. The sampling grid's natural shape is
+[C, m*P, 1, 2], which is the worst case, and it was 161 ms of a 499 ms DFA
+call -- more than grid_sample's own arithmetic at some chunk sizes.
+
+The fix is to upload wide and reshape on device: 118.0 ms -> 1.2 ms upload plus
+6.5 ms reshape, output bit-identical.
+
+This also explains an earlier wrong conclusion. Building the grid on device
+instead of round-tripping it was rejected because it measured slower, and the
+reason given was tile padding on a last dimension of 2. The rejection was
+right; the reason was not. The round-trip was expensive for a different reason
+and could be fixed without moving the assembly at all.
+
+Related, same family: `ttnn.from_torch(x_fp32, dtype=bfloat16)` converts dtype
+itself and is slow at it. `x.bfloat16()` first, then from_torch, took the same
+grid from 160.9 ms to 62.5 ms. Cast on the host.
+
+### grid_sample is bound per point, not per channel
+
+    points     C    ms    ns/point
+     32000    32   5.63      58.7
+     32000   256   5.60      58.3
+    512000    32  84.15      54.8
+    512000   256  85.32      55.5
+
+Eight times the channels, identical time. The cost is the per-point coordinate
+work, not the gather, which is why `ttnn.grid_precompute` exists -- it moves
+that work out of the sampler. It also means `grid_compact` buys less than the
+visible-point fraction suggests: dropping 68% of the points drops 68% of the
+per-point cost and nothing else.
+
+For scale: 6.14M samples x 4 neighbours x 256 channels is 6.3 GMAC, about
+0.2 ms at bf16 peak. The op takes 186 ms. Nothing here is FPU-bound.
+
 ### The device was half idle for most of this port
 
 N300 is two chips, 64 cores each. `ttnn.open_device(device_id=0)` opens one of

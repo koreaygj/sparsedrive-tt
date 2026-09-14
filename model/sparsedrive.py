@@ -48,7 +48,8 @@ class TtSparseDrive:
     def features(self, imgs):
         """imgs [cams, 3, H, W] -> per-level ttnn NHWC + the image tokens."""
         x = torch.nn.functional.pad(imgs.permute(0, 2, 3, 1), (0, 1))
-        xt = ttnn.from_torch(x.reshape(1, 1, self.C * self.H * self.W, 4).contiguous(),
+        xt = ttnn.from_torch(
+            x.reshape(1, 1, self.C * self.H * self.W, 4).bfloat16().contiguous(),
                              dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT,
                              device=self.dev, mesh_mapper=_mapper(self.dev)[1])
         outs = self.fpn(self.backbone(xt))
@@ -60,7 +61,7 @@ class TtSparseDrive:
             v = to_host(t, self.dev).float().reshape(-1, c)[:self.C * h * w]
             v = v.reshape(self.C, h, w, c)
             levels.append(ttnn.from_torch(
-                v.contiguous(), layout=ttnn.ROW_MAJOR_LAYOUT, device=self.dev,
+                v.bfloat16().contiguous(), layout=ttnn.ROW_MAJOR_LAYOUT, device=self.dev,
                 dtype=ttnn.bfloat16, mesh_mapper=_mapper(self.dev)[1]))
             last = v
         # image tokens for the velocity branch's cross-attention: the coarsest

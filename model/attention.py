@@ -37,8 +37,9 @@ def _mapper(device):
 
 
 def _t(x, device, dtype=ttnn.bfloat16):
+    from .dfa import _cast
     _, rep, _ = _mapper(device)
-    return ttnn.from_torch(x.contiguous(), layout=ttnn.TILE_LAYOUT,
+    return ttnn.from_torch(_cast(x, dtype).contiguous(), layout=ttnn.TILE_LAYOUT,
                            device=device, dtype=dtype, mesh_mapper=rep)
 
 

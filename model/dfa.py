@@ -30,6 +30,20 @@ short version:
 import torch
 import ttnn
 
+def _cast(x, dt):
+    """Convert on the host before handing the tensor over.
+
+    ttnn.from_torch will convert dtype itself, and it is slow at it: a 5.9 MB
+    grid took 160.9 ms as fp32 -> bfloat16, against 62.5 ms when torch did the
+    cast first and from_torch only copied. Same bits either way.
+    """
+    if dt == ttnn.bfloat16 and x.dtype != torch.bfloat16:
+        return x.bfloat16()
+    if dt == ttnn.float32 and x.dtype != torch.float32:
+        return x.float()
+    return x
+
+
 FIX_HEIGHT = (0.0, -0.25, -0.5, 0.25, 0.5)
 NUM_LEARNABLE = 2
 LOFI = dict(math_fidelity=ttnn.MathFidelity.LoFi, fp32_dest_acc_en=True, packer_l1_acc=True)
@@ -67,12 +81,12 @@ class TtDFA:
 
         g = lambda k: sd[prefix + k].float()
         T = lambda x, dt=ttnn.bfloat16: ttnn.from_torch(
-            x.contiguous(), layout=ttnn.TILE_LAYOUT, device=device, dtype=dt,
-            mesh_mapper=self.rep)
+            _cast(x, dt).contiguous(), layout=ttnn.TILE_LAYOUT, device=device,
+            dtype=dt, mesh_mapper=self.rep)
         self.T, self.f32 = T, ttnn.float32
         # anchor-sharded uploads, and the composer that puts them back together
         self.S = lambda x, dt=ttnn.bfloat16, d=0: ttnn.from_torch(
-            x.contiguous(), layout=ttnn.TILE_LAYOUT, device=device, dtype=dt,
+            _cast(x, dt).contiguous(), layout=ttnn.TILE_LAYOUT, device=device, dtype=dt,
             mesh_mapper=(self.sh0 if d == 0 else self.sh1) if self.nd > 1 else None)
         self.G2T = lambda t: ttnn.to_torch(t, mesh_composer=self.cat0)
 
@@ -108,7 +122,8 @@ class TtDFA:
     def upload_levels(self, mc_ms_feat, shapes, starts):
         """[1, C, F, E] -> per-level NHWC on device. Once per frame."""
         return [ttnn.from_torch(
-            mc_ms_feat[0, :, s:s + h * w, :].reshape(self.C, h, w, self.E).contiguous(),
+            _cast(mc_ms_feat[0, :, s:s + h * w, :].reshape(self.C, h, w, self.E),
+                  ttnn.bfloat16).contiguous(),
             layout=ttnn.ROW_MAJOR_LAYOUT, device=self.dev, dtype=ttnn.bfloat16,
             mesh_mapper=self.rep)
             for (h, w), s in zip(shapes, starts)]
@@ -228,9 +243,23 @@ class TtDFA:
             W = self._weights(f_tt, cam, m, self.S(keep))
             # grid is [C, m*P, 1, 2] with points anchor-major, so sharding dim 1
             # splits the same anchors that dim 0 of feat did.
-            g_tt = ttnn.from_torch(grid, layout=ttnn.ROW_MAJOR_LAYOUT,
-                                   device=self.dev, dtype=ttnn.bfloat16,
-                                   mesh_mapper=self.sh1)
+            # Upload wide, reshape on device.
+            #
+            # from_torch costs per row, not per byte. The grid's natural shape
+            # [C, m*P, 1, 2] is two bf16 values per row, which uploads at
+            # 50 MB/s; the same bytes as [C, m*P*2/256, 256] go at 4516 MB/s.
+            # Measured on the layer-0 grid, 5.9 MB: 118.0 ms direct against
+            # 1.2 ms wide plus 6.5 ms for the device-side reshape. The sampled
+            # output is bit-identical -- nothing changes but the row count.
+            #
+            # Shard on dim 1 either way: the wide shape keeps anchor-major
+            # order, so half the rows is still the first half of the anchors.
+            gw = _cast(grid, ttnn.bfloat16).reshape(
+                self.C, m * self.P * 2 // 256, 256).contiguous()
+            g_tt = ttnn.reshape(
+                ttnn.from_torch(gw, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.dev,
+                                dtype=ttnn.bfloat16, mesh_mapper=self.sh1),
+                (self.C, (m // self.nd) * self.P, 1, 2))
             ml = m // self.nd
             per = []
             for fm in levels_tt:
