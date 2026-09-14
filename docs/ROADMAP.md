@@ -309,6 +309,70 @@ on the host triples the grid upload and gives the win back. It has to be
 `ttnn.grid_precompute`, on device, which is why that op takes a compacted Q14
 grid and couples to `grid_compact`.
 
+### The grid's point order is the feature tensor's axis order
+
+`grid_sample` emits one output row per grid row, so whatever order the grid
+puts its points in is the order the features come back in. The port had the
+grid anchor-major, which makes the output [C, ml, P, E], and
+`grouped_weighted_sum` wants [C*P, ml, E] -- so every frame transposed the
+anchor and point axes of a 1.46 GiB tensor.
+
+That was invisible while the sampler and the permute were timed together as
+one 68.3 ms stage. Split:
+
+    grid_sample x4          32.5 ms
+    reshape/permute/reshape 35.7 ms      <- more than the sampling
+
+Laying the grid out point-major instead makes the reshape free. The transpose
+moves to the host, onto the 6 MB grid, and has to happen INSIDE each device's
+anchor block: ShardTensorToMesh cuts dim 1 into nd equal runs, and an anchor
+must keep all its points on the device that holds its features. So the host
+writes nd point-major blocks back to back and the sharding cuts between them.
+
+68.3 -> 32.7 ms, DAF[0] 135 -> 99, frame 242.2 -> 210.0, and the PCC does not
+move a digit because nothing about the arithmetic changed.
+
+### grid_compact does not pay here, and point-major is why
+
+Compaction drops the (camera, row) pairs with no in-bounds point. It is the
+third leg of the chain the soft-float finding pointed at, and on these shapes
+it loses. Measured, not estimated:
+
+    row granularity      DAF[0]   DAF[1]   DAF[2]     (fraction SURVIVING)
+    per point             32.2%    30.1%    12.8%
+    8-point rows          46.7%    32.0%    21.8%
+    16-point, anchor-major 51.7%    33.0%    26.7%
+    16-point, point-major  87.2%    47.0%    18.1%
+
+A row is 16 points because that is grid_precompute's coords tile. Anchor-major
+those 16 are one anchor's neighbouring samples -- spatially coherent, so half
+the rows die together. Point-major they are 16 different anchors at one sample
+index, which are unrelated, so almost every row keeps something: 87.2%
+survive on DAF[0] and there is nothing to compact.
+
+The two wins are therefore mutually exclusive, and point-major is the bigger
+one:
+
+    point-major, no compaction    grid_sample 32.7 + precompute 4.7  = 37.4 ms
+    anchor-major + compaction     17.4 + scatter ~19 + compact 6.6
+                                     + precompute 2.5                = 45.5 ms
+
+`grid_compact` itself measured 6.6 ms at this shape and kept 53.5%, close to
+the 51.7% predicted (the gap is that its threshold is one bound for all four
+levels, so it keeps rows only the coarsest level can see).
+
+The scatter in that second row is also not free to write: compaction leaves
+the features packed, and gws needs them dense. sparse4D does that with
+`transposed_s2i`, which takes an L1-SHARDED input -- fine for its 68.6 MB
+feature buffer, impossible for this model's 1.46 GiB. A DRAM-to-DRAM scatter
+would have to be written first.
+
+One thing does carry over if this is ever revisited: the stale-data trick is
+valid for this model. A dropped row's true contribution is exactly zero,
+because out-of-bounds points sample zeros, so zeroing its weight with
+grid_compact's `flags` gives the same answer as zeroing the feature buffer --
+which is what makes the dense buffer reusable across frames.
+
 ### Half the cost of the reduction was slicing it
 
 `grouped_weighted_sum` fixed its reduction at 2 partial sums. That one constant
