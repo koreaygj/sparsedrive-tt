@@ -42,6 +42,8 @@ short version:
 import torch
 import ttnn
 
+from .mesh import fabric_on
+
 def _cast(x, dt):
     """Convert on the host before handing the tensor over.
 
@@ -415,6 +417,24 @@ class TtDFA:
             ttnn.deallocate(t)
         return g_tt, base
 
+    def _gather(self, res, m):
+        """[ml, E] sharded by anchor -> [m, E] on every device.
+
+        The attention that consumes this is self-attention over all m anchors,
+        so each chip needs all of them. That used to be a download and an
+        upload: 3.25 ms at m = 1024. all_gather is 0.17, and exact -- but only
+        with the fabric on, and without it the call hangs the device rather
+        than failing, so the host path stays as the fallback. See
+        model/mesh.py enable_fabric.
+        """
+        if self.nd == 1:
+            return res
+        if fabric_on():
+            return ttnn.all_gather(res, dim=0, topology=ttnn.Topology.Linear)
+        return ttnn.from_torch(
+            self.G2T(res).float()[:m].bfloat16().contiguous(), layout=ttnn.TILE_LAYOUT,
+            device=self.dev, dtype=ttnn.bfloat16, mesh_mapper=self.rep)
+
     def _expand_mask(self, base, nl):
         """[nl, C*P] -> [nl, clp*G], the mask in (camera, level, point, group).
 
@@ -512,7 +532,7 @@ class TtDFA:
             f"{GP_K}-point grid rows")
         cam = self._camera_embed(proj)
         consts = self._gp_pack(levels_tt)
-        out = torch.zeros(n, self.E)
+        outs = []
         for a0 in range(0, n, chunk):
             a1 = min(a0 + chunk, n)
             m = a1 - a0
@@ -573,8 +593,17 @@ class TtDFA:
             acc = ttnn.slice(tot, [0, 0], [ml, self.E])
             proj_out = ttnn.linear(acc, self.Wo, bias=self.Bo,
                                    compute_kernel_config=self.hi)
-            out[a0:a1] = self.G2T(ttnn.add(proj_out, f_tt)).float()[:m]
+            res = ttnn.add(proj_out, f_tt)              # [ml, E], this device's anchors
+            g = self._gather(res, m)
+            outs.append(g)
             ttnn.deallocate(acc)
+            if g is not res:                            # _gather passes it through at nd == 1
+                ttnn.deallocate(res)
             for t in (f_tt, g_tt, base, tot, proj_out, *gp, *Wl):
                 ttnn.deallocate(t)
-        return out
+        if len(outs) == 1:
+            return outs[0]
+        r = ttnn.concat(outs, dim=0)
+        for t in outs:
+            ttnn.deallocate(t)
+        return r

@@ -24,6 +24,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from model.features import build            # noqa: E402
 from model.sparsedrive import TtSparseDrive  # noqa: E402
+from model.mesh import enable_fabric      # noqa: E402
 
 EXP = pathlib.Path(os.environ["NAVSIM_EXP_ROOT"])
 CKPT = ROOT / "ckpt" / "sparsedrive_navsimv1.ckpt"
@@ -48,6 +49,8 @@ def main():
     print(f"  토큰 {len(files)}개  (완료 {len(done)}개 건너뜀)", flush=True)
 
     sd = torch.load(CKPT, map_location="cpu", weights_only=False)["state_dict"]
+    if not args.single:
+        enable_fabric()
     dev = (ttnn.open_device(device_id=0, l1_small_size=24576) if args.single
            else ttnn.open_mesh_device(ttnn.MeshShape(1, 2), l1_small_size=24576))
     try:

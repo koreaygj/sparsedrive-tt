@@ -59,8 +59,10 @@ def main():
             CH = 128
             dfa(feat, anchor, levels, proj, iwh, chunk=CH)
             ttnn.synchronize_device(dev); t0 = time.time()
-            got = dfa(feat, anchor, levels, proj, iwh, chunk=CH)
+            got_tt = dfa(feat, anchor, levels, proj, iwh, chunk=CH)
             ttnn.synchronize_device(dev); dt = (time.time() - t0) * 1e3
+            # the DFA returns a device tensor now, gathered to every chip
+            got = dfa.G2T(got_tt).float()[:n]
             p = pcc(got, ref); ok &= p >= 0.999
             print(f"  {key[:-1]:20s} n={n:5d} P={dfa.P:3d} clp={dfa.clp:5d}"
                   f"  {dt:8.1f} ms  PCC {p:.6f}")

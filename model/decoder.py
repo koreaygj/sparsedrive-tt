@@ -61,9 +61,12 @@ class TtDecoderLayer:
                 pre_attn=None, img=None, ti=None):
         """DFA -> (optional cross-attn) -> self-attn -> norm -> FFN -> norm -> score."""
         T = x.shape[0]
+        # The DFA hands back a device tensor, already gathered to every chip.
+        # Only the branch without one (velocity) still starts from the host.
         if dfa is not None:
-            x = dfa(x, anchor, levels, proj, iwh)
-        xt = _t(x, self.dev)
+            xt = dfa(x, anchor, levels, proj, iwh)
+        else:
+            xt = _t(x, self.dev)
         if pre_attn is not None:      # velocity branch attends to image tokens first
             xt = ttnn.add(xt, pre_attn(xt, img, img, tq=T, tk=ti))
         xt = ttnn.add(xt, attn(xt, tq=T))
@@ -93,8 +96,7 @@ class TtDecoderLayer:
         n_p, n_v = p_emb.shape[0], v_emb.shape[0]
         traj = (p_emb.unsqueeze(1) + v_emb.unsqueeze(0)).reshape(n_p * n_v, -1)
         T = traj.shape[0]
-        traj = self.t_dfa(traj, traj_anchor, levels, proj, iwh)
-        xt = _t(traj, self.dev)
+        xt = self.t_dfa(traj, traj_anchor, levels, proj, iwh)
         xt = ttnn.add(xt, self.t_attn(xt, tq=T))
         xt = _ln(xt, *self.norms["t_norm1"])
         xt = ttnn.add(xt, self.t_ffn(xt))
