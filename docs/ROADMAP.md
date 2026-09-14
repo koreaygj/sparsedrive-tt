@@ -214,6 +214,36 @@ PCC has a shape worth reading, too. Wrong tensor entirely reads 0.3; right
 tensor off by one constant row reads 0.88; right tensor reads four nines. 0.88
 means structure is right and an offset is missing, not that precision is poor.
 
+### The device was half idle for most of this port
+
+N300 is two chips, 64 cores each. `ttnn.open_device(device_id=0)` opens one of
+them, and everything up to the performance pass ran on 50% of the hardware
+without that ever surfacing -- no warning, no error, just half the throughput.
+`ttnn.GetNumAvailableDevices()` reports 2; check it.
+
+Anchor block size was worth almost as much as the second chip and cost nothing:
+
+    chunk  64  1488.5 ms      chunk 256  935.7 ms
+    chunk 128  1116.1 ms      chunk 512  844.1 ms
+
+PCC identical at every size. Small blocks re-pay the launch and the slicing per
+block.
+
+### A profiler naming waste does not mean removing it is cheaper
+
+Profiling put 142 ms of DAF[0]'s 1136 (12.5%) in uploading a grid that had just
+been computed on device and downloaded -- apparently free money. Building it on
+device instead made DAF[0] 1113 -> 1482 ms.
+
+The grid's last dimension is 2, and a TILE tensor pads its last dimension to
+32, so assembling it from [1, n*P, 1, 1] pieces spends 30 of every 32 columns
+on padding. The round-trip moves less than the device assembly wastes. Doing it
+properly needs a kernel that writes the packed layout -- which is what
+`ttnn.grid_precompute` is for.
+
+Third time this port has been shaped by tile alignment (G=8 wasting 24 of 32,
+keypoints' last-dim-3 wasting 29), and the first time it was not anticipated.
+
 ### Measurement discipline
 
 Four times this session a device time was really JIT compile: 1272 ms that was
@@ -307,7 +337,28 @@ is the same 6000: 9.4e-4 over a 2000-long axis, 4.2e-3 over 6000.
 
 sparse4D reduces over 312.
 
-### 5. Split the mesh by anchor, not by camera
+### 5. Split the mesh by anchor, not by camera — *done, 1.51x*
+
+Implemented and measured on DAF[0], 1024 anchors, chunk 512:
+
+    single device (64 cores)   845.2 ms   PCC 0.999868
+    mesh(1,2)    (128 cores)   559.5 ms   PCC 0.999868
+
+PCC identical to six decimals, which is the check that the split axis is right:
+the same arithmetic, divided. Weights and feature maps replicate (8.4M
+elements); `feat`, `anchor` and `keep` shard on dim 0; `grid [C, m*P, 1, 2]` and
+`features [clp, m, E]` shard on dim 1, which cuts the same anchors because the
+points are anchor-major.
+
+Every custom kernel takes mesh tensors -- `grouped_weighted_sum`,
+`grid_sample`, `topk_select` were all probed before the rewrite rather than
+after.
+
+The original reasoning held: softmax normalises over clp for one anchor, so an
+anchor-sharded tensor keeps every denominator local and no all_reduce appears
+anywhere.
+
+### 5b. Superseded note
 
 sparse4D-tt gave each of 2 chips 3 of 6 cameras, which is what produced the
 softmax bug in its README — each device normalised over its own half. Three

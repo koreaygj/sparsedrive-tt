@@ -44,7 +44,20 @@ def legal_splits(clp, G=8):
 class TtDFA:
     def __init__(self, sd, prefix, device, num_sample, num_cams=3, num_levels=4,
                  num_groups=8, embed_dims=256):
+        """`device` may be a MeshDevice, in which case anchors shard across it.
+
+        Anchors rather than cameras. The softmax normalises over clp for one
+        anchor, so an anchor-sharded tensor keeps every denominator local and
+        no all_reduce is needed -- which also removes the failure sparse4D-tt
+        hit when it split 6 cameras 3/3 and each device normalised over its own
+        half. The feature maps replicate instead; they are 8.4M elements.
+        """
         self.dev, self.C, self.L, self.G, self.E = device, num_cams, num_levels, num_groups, embed_dims
+        self.nd = device.get_num_devices() if hasattr(device, "get_num_devices") else 1
+        self.rep = ttnn.ReplicateTensorToMesh(device) if self.nd > 1 else None
+        self.sh0 = ttnn.ShardTensorToMesh(device, dim=0) if self.nd > 1 else None
+        self.sh1 = ttnn.ShardTensorToMesh(device, dim=1) if self.nd > 1 else None
+        self.cat0 = ttnn.ConcatMeshToTensor(device, dim=0) if self.nd > 1 else None
         self.ns = num_sample
         self.P = num_sample * len(FIX_HEIGHT) * NUM_LEARNABLE
         self.clp = num_cams * num_levels * self.P
@@ -54,8 +67,14 @@ class TtDFA:
 
         g = lambda k: sd[prefix + k].float()
         T = lambda x, dt=ttnn.bfloat16: ttnn.from_torch(
-            x.contiguous(), layout=ttnn.TILE_LAYOUT, device=device, dtype=dt)
+            x.contiguous(), layout=ttnn.TILE_LAYOUT, device=device, dtype=dt,
+            mesh_mapper=self.rep)
         self.T, self.f32 = T, ttnn.float32
+        # anchor-sharded uploads, and the composer that puts them back together
+        self.S = lambda x, dt=ttnn.bfloat16, d=0: ttnn.from_torch(
+            x.contiguous(), layout=ttnn.TILE_LAYOUT, device=device, dtype=dt,
+            mesh_mapper=(self.sh0 if d == 0 else self.sh1) if self.nd > 1 else None)
+        self.G2T = lambda t: ttnn.to_torch(t, mesh_composer=self.cat0)
 
         self.Wl = T(g("kps_generator.learnable_fc.weight").t(), ttnn.float32)
         self.Bl = T(g("kps_generator.learnable_fc.bias").reshape(1, -1), ttnn.float32)
@@ -90,7 +109,8 @@ class TtDFA:
         """[1, C, F, E] -> per-level NHWC on device. Once per frame."""
         return [ttnn.from_torch(
             mc_ms_feat[0, :, s:s + h * w, :].reshape(self.C, h, w, self.E).contiguous(),
-            layout=ttnn.ROW_MAJOR_LAYOUT, device=self.dev, dtype=ttnn.bfloat16)
+            layout=ttnn.ROW_MAJOR_LAYOUT, device=self.dev, dtype=ttnn.bfloat16,
+            mesh_mapper=self.rep)
             for (h, w), s in zip(shapes, starts)]
 
     def _camera_embed(self, proj):
@@ -103,6 +123,23 @@ class TtDFA:
                                weight=self.ln_w[1], bias=self.ln_b[1])
 
     def _project(self, feat32, anchor32, n, proj, iwh):
+        """-> (grid on host, in-bounds mask on host).
+
+        The grid round-trips: u and v are computed on device, brought back,
+        stacked, and uploaded again. Profiling puts that upload at 142 ms of
+        DAF[0]'s 1136 (12.5%), so assembling it on device looks like free
+        money. It is not -- measured, that made DAF[0] 1113 -> 1482 ms.
+
+        The reason is the same tile arithmetic that shapes the rest of this
+        port: the grid's last dimension is 2, and a TILE tensor pads its last
+        dimension to 32, so building it from [1, n*P, 1, 1] pieces and
+        concatenating spends 30 of every 32 columns on padding. The host
+        round-trip moves less than the device assembly wastes.
+
+        Doing this properly needs a kernel that writes the packed layout
+        directly -- which is what sparse4D-tt's ttnn.grid_precompute is for.
+        Left as a round-trip until there is reason to build that.
+        """
         off = ttnn.linear(feat32, self.Wl, bias=self.Bl, compute_kernel_config=self.hi)
         x = ttnn.add(ttnn.matmul(off, self.Ox, compute_kernel_config=self.hi),
                      ttnn.matmul(anchor32, self.Ax, compute_kernel_config=self.hi))
@@ -121,8 +158,8 @@ class TtDFA:
             Z = ttnn.clamp(ttnn.add(ttnn.add(ttnn.multiply(x, float(Pm[2, 0])),
                                              ttnn.multiply(y, float(Pm[2, 1]))), cz),
                            1e-5, 1e30)
-            u = ttnn.to_torch(ttnn.multiply(ttnn.divide(X, Z), 1.0 / float(iwh[c, 0]))).float()
-            v = ttnn.to_torch(ttnn.multiply(ttnn.divide(Y, Z), 1.0 / float(iwh[c, 1]))).float()
+            u = self.G2T(ttnn.multiply(ttnn.divide(X, Z), 1.0 / float(iwh[c, 0]))).float()
+            v = self.G2T(ttnn.multiply(ttnn.divide(Y, Z), 1.0 / float(iwh[c, 1]))).float()
             grids.append(torch.stack([u * 2 - 1, v * 2 - 1], -1))
             inb.append((u > 0) & (u < 1) & (v > 0) & (v < 1))
             for q in (cx, cy, cz, X, Y, Z):
@@ -131,13 +168,15 @@ class TtDFA:
         return torch.stack(grids, 0).reshape(self.C, n * self.P, 1, 2), torch.stack(inb, 1)
 
     def _weights(self, feat_tt, cam, n, keep):
-        fx = ttnn.add(ttnn.reshape(feat_tt, (n, 1, self.E)),
+        """n is the global anchor count; each device holds n // nd of them."""
+        nl = n // self.nd
+        fx = ttnn.add(ttnn.reshape(feat_tt, (nl, 1, self.E)),
                       ttnn.reshape(cam, (1, self.C, self.E)))
-        wl = ttnn.linear(ttnn.reshape(fx, (n * self.C, self.E)), self.Wf, bias=self.Bf,
+        wl = ttnn.linear(ttnn.reshape(fx, (nl * self.C, self.E)), self.Wf, bias=self.Bf,
                          compute_kernel_config=self.hi)
-        logits = ttnn.reshape(wl, (n, self.wide))
+        logits = ttnn.reshape(wl, (nl, self.wide))
         mx = ttnn.max(logits, dim=-1, keepdim=True)
-        e = ttnn.multiply(ttnn.exp(ttnn.subtract(logits, mx)), self.T(keep))
+        e = ttnn.multiply(ttnn.exp(ttnn.subtract(logits, mx)), keep)
         s = ttnn.matmul(e, self.gt, compute_kernel_config=self.lo, dtype=self.f32)
         sb = ttnn.matmul(s, self.st, compute_kernel_config=self.hi, dtype=self.f32)
         ttnn.deallocate(s)
@@ -145,8 +184,19 @@ class TtDFA:
         ttnn.deallocate(e); ttnn.deallocate(sb)
         return w
 
-    def __call__(self, feat, anchor, levels_tt, proj, iwh, chunk=128, splits=None):
-        """feat [n, E] torch, anchor [n, num_sample*2] torch. -> [n, E] torch."""
+    def __call__(self, feat, anchor, levels_tt, proj, iwh, chunk=512, splits=None):
+        """feat [n, E] torch, anchor [n, num_sample*2] torch. -> [n, E] torch.
+
+        chunk 512 rather than 128: measured on DAF[0], with PCC identical to
+        six decimals throughout, the anchor block size is worth 1.76x.
+
+            chunk   64  1488.5 ms      chunk  256   935.7 ms
+            chunk  128  1116.1 ms      chunk  512   844.1 ms
+
+        Smaller blocks re-pay the kernel launch and the slicing per block; the
+        arithmetic does not change. Bounded above by L1 and by the [clp, m, E]
+        buffer, which at 512 anchors and clp 6000 is 786 MB in bf16.
+        """
         n = feat.shape[0]
         if splits is None:
             splits = max(k for k in legal_splits(self.clp) if k <= 10)
@@ -157,35 +207,42 @@ class TtDFA:
         for a0 in range(0, n, chunk):
             a1 = min(a0 + chunk, n)
             m = a1 - a0
-            f_tt = self.T(feat[a0:a1])
-            grid, inb = self._project(self.T(feat[a0:a1], self.f32),
-                                      self.T(anchor[a0:a1], self.f32), m, proj, iwh)
+            assert m % self.nd == 0, (
+                f"chunk {m} must divide across {self.nd} devices; "
+                f"pick a chunk that divides {n} into multiples of {self.nd}")
+            f_tt = self.S(feat[a0:a1])
+            grid, inb = self._project(self.S(feat[a0:a1], self.f32),
+                                      self.S(anchor[a0:a1], self.f32), m, proj, iwh)
             mp = inb[:, :, None, :, None]
             keep = (~torch.logical_and(~mp, mp.sum(1, keepdim=True) != 0)).float()
             keep = keep.expand(m, self.C, self.L, self.P, self.G).reshape(m, self.wide)
-            W = self._weights(f_tt, cam, m, keep)
+            W = self._weights(f_tt, cam, m, self.S(keep))
+            # grid is [C, m*P, 1, 2] with points anchor-major, so sharding dim 1
+            # splits the same anchors that dim 0 of feat did.
             g_tt = ttnn.from_torch(grid, layout=ttnn.ROW_MAJOR_LAYOUT,
-                                   device=self.dev, dtype=ttnn.bfloat16)
+                                   device=self.dev, dtype=ttnn.bfloat16,
+                                   mesh_mapper=self.sh1)
+            ml = m // self.nd
             per = []
             for fm in levels_tt:
                 s_ = ttnn.grid_sample(fm, g_tt, padding_mode="zeros", align_corners=False)
-                per.append(ttnn.permute(ttnn.reshape(s_, (self.C, m, self.P, self.E)),
+                per.append(ttnn.permute(ttnn.reshape(s_, (self.C, ml, self.P, self.E)),
                                         (0, 2, 1, 3)))
-            feats = ttnn.reshape(ttnn.concat(per, dim=1), (self.clp, m, self.E))
+            feats = ttnn.reshape(ttnn.concat(per, dim=1), (self.clp, ml, self.E))
             sl = self.clp // splits
             acc = torch.zeros(m, self.E)
             for i in range(splits):
-                fi = ttnn.slice(feats, [i * sl, 0, 0], [(i + 1) * sl, m, self.E])
-                wi = ttnn.slice(W, [0, i * sl * self.G], [m, (i + 1) * sl * self.G])
+                fi = ttnn.slice(feats, [i * sl, 0, 0], [(i + 1) * sl, ml, self.E])
+                wi = ttnn.slice(W, [0, i * sl * self.G], [ml, (i + 1) * sl * self.G])
                 o = ttnn.grouped_weighted_sum(fi, wi, num_groups=self.G,
                                               group_dims=self.E // self.G)
-                mp_ = ((m + 31) // 32) * 32
-                acc += ttnn.to_torch(ttnn.add(ttnn.slice(o, [0, 0], [m, self.E]),
-                                              ttnn.slice(o, [mp_, 0], [mp_ + m, self.E]))).float()
+                mp_ = ((ml + 31) // 32) * 32
+                acc += self.G2T(ttnn.add(ttnn.slice(o, [0, 0], [ml, self.E]),
+                                         ttnn.slice(o, [mp_, 0], [mp_ + ml, self.E]))).float()
                 ttnn.deallocate(fi); ttnn.deallocate(wi); ttnn.deallocate(o)
-            proj_out = ttnn.linear(self.T(acc), self.Wo, bias=self.Bo,
+            proj_out = ttnn.linear(self.S(acc), self.Wo, bias=self.Bo,
                                    compute_kernel_config=self.hi)
-            out[a0:a1] = ttnn.to_torch(ttnn.add(proj_out, f_tt)).float()[:m]
+            out[a0:a1] = self.G2T(ttnn.add(proj_out, f_tt)).float()[:m]
             for t in (f_tt, g_tt, feats, W, proj_out):
                 ttnn.deallocate(t)
         return out
