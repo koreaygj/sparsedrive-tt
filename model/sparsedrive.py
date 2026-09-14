@@ -48,10 +48,16 @@ class TtSparseDrive:
     def features(self, imgs):
         """imgs [cams, 3, H, W] -> per-level ttnn NHWC + the image tokens."""
         x = torch.nn.functional.pad(imgs.permute(0, 2, 3, 1), (0, 1))
-        xt = ttnn.from_torch(
-            x.reshape(1, 1, self.C * self.H * self.W, 4).bfloat16().contiguous(),
-                             dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT,
-                             device=self.dev, mesh_mapper=_mapper(self.dev)[1])
+        # Upload wide, reshape on device. The backbone wants [1, 1, N, 4], and
+        # from_torch costs per ROW: 393,216 rows of 8 bytes measured 30.5 ms
+        # for 3 MB, where the same bytes as 6,144 rows of 256 take 2.6. Same
+        # trick the sampling grid needed, same reason, and bit-identical.
+        n4 = self.C * self.H * self.W
+        xt = ttnn.reshape(
+            ttnn.from_torch(x.reshape(1, 1, n4 * 4 // 256, 256).bfloat16().contiguous(),
+                            dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT,
+                            device=self.dev, mesh_mapper=_mapper(self.dev)[1]),
+            (1, 1, n4, 4))
         outs = self.fpn(self.backbone(xt))
         levels, last = [], None
         for (t, h, w, c) in outs:
