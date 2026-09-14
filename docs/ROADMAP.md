@@ -129,6 +129,24 @@ Attention also scores lower than the FFNs beside it -- 0.99991-0.99995 against
 length sets the accumulator drift. At 1024 and 384 tokens it is mild; the DFA's
 6000-wide one was not.
 
+### Dumping module inputs *and* outputs pays for itself
+
+The six decoder LayerNorms were never hooked in `dump_golden.py`, and did not
+need a re-dump. Every one sits between two modules that were hooked, so its
+input is a sum of tensors already on disk:
+
+    p_norm1( p_deform_model.out + p_attention.out[0] )  ==  p_ffn.in[0]
+    p_norm2( p_ffn.in[0]        + p_ffn.out         )  ==  path_mlp.in[0]
+
+That is a better check than the one a re-dump would have given: it grades the
+residual add along with the norm against a real boundary value, rather than
+grading `ttnn.layer_norm` against torch on synthetic input. Dropout is identity
+at eval, so it falls out of the identity.
+
+The same property caught a wrong reference earlier -- `row_gather` takes two
+sources, and the one that stayed at 0.999998 while the other sat at 0.33 said
+the gather was fine. Prefer references with a built-in control.
+
 ### Conv is a layout problem, not an arithmetic one
 
 Nothing in the backbone needed a precision decision. Sixteen BasicBlocks and
