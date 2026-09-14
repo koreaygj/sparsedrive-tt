@@ -57,6 +57,18 @@ saw on a real navtest frame.
 | `output_proj` | **done** | |
 | **whole module, end to end** | **done** | **0.999869** |
 
+Lifted out of the PoC into `model/dfa.py`, parameterised by `num_sample`, and
+checked against all three calls a frame makes rather than just the first:
+
+| call | anchors | num_pts | clp | | PCC |
+|---|---:|---:|---:|---:|---:|
+| layer 0 path | 1024 | 500 | 6000 | 1113.5 ms | 0.999868 |
+| layer 1 path | 128 | 500 | 6000 | 141.5 ms | 0.999549 |
+| layer 1 traj | 400 | 80 | **960** | 97.7 ms | 0.999988 |
+
+The trajectory branch had never been run before this -- clp 960 rather than
+6000 -- and the compact layout's split constraint holds there too.
+
 Moving the assembly onto the device took the chunk from 1272 ms to 366 ms, and
 the host side from 439 ms to 12 ms, at the same accuracy.
 
@@ -167,9 +179,15 @@ means structure is right and an offset is missing, not that precision is poor.
 
 ### Measurement discipline
 
-Three times this session a device time was really JIT compile: 1272 ms that was
-366, 339 ms that was 3.8, 292 ms that was 2.8. Warm every variant before
-timing it, and never compare a fresh config against a cached one.
+Four times this session a device time was really JIT compile: 1272 ms that was
+366, 339 ms that was 3.8, 292 ms that was 2.8, and 5613 ms that was 97.7.
+
+**Warm at the shape you will time, not the function.** The last one warmed the
+same DFA call with chunk=32 and timed it at chunk=128; a different chunk is a
+different tensor shape is a different kernel, so the "warm" run compiled
+nothing that the timed run used. It only got caught because the answer was
+physically impossible -- the trajectory branch does a sixteenth of layer 0's
+work and read 1.45x its time. A plausible wrong number would have survived.
 
 Likewise, three hypotheses about the row-sum error (axis length, `ttnn.divide`,
 the mask itself) were each wrong, and each took a run to disprove. Pulling out
