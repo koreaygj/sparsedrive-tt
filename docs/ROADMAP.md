@@ -309,6 +309,52 @@ on the host triples the grid upload and gives the win back. It has to be
 `ttnn.grid_precompute`, on device, which is why that op takes a compacted Q14
 grid and couples to `grid_compact`.
 
+### Half the cost of the reduction was slicing it
+
+`grouped_weighted_sum` fixed its reduction at 2 partial sums. That one constant
+set two unrelated things, and both were wrong here:
+
+  - **parallelism.** Work units are ceil(anchors/32) * num_chunks. This DFA
+    reduces 6000 clp into 512 anchors a chip -- 16 tile rows -- so 2 chunks is
+    32 work units on 64 cores. Half the device idle, measured 33 GiB/s on a
+    288 GiB/s part.
+  - **accuracy.** Each partial accumulates in bf16 through the packer, so the
+    drift grows with its depth. `splits` was slicing feats to shorten it, which
+    costs a full 1.46 GiB copy a chip -- 26.8 ms -- for what the op could have
+    done for nothing.
+
+Making num_chunks a parameter fixes both at once. It is flat past 4 chunks
+because those are exact multiples of the core count, so the accumulator depth
+is free and the choice is purely accuracy:
+
+    num_chunks   work units   clp/partial   gws       DAF[0]     DAF[1]
+             2           32          3000   41.7 ms   0.998712*
+             4           64          1500   21.0 ms
+             8          128           750   20.9 ms   0.999671   0.998983
+            16          256           375   21.0 ms   0.999883   0.999704
+            30          500           200             0.999958   0.999905
+            40          640           150             0.999972   0.999932
+                                            (* vs fp64; the rest vs PyTorch)
+
+30, not 40: DAF[1] has 128 anchors, so 4 tile rows, and 40 chunks is 160 work
+units on 64 cores -- 2.5 rounds -- which measured slower there.
+
+Two things fell out that were not the point. The old `splits=10 x
+num_chunks=2` had an effective partial depth of 300, not the 600 the slicing
+suggested, which is why the first attempt at 16 chunks (375) read as a
+regression. And the trajectory went back to bit-identical on the mesh, because
+the extra accuracy moved the risk-6 near-tie back onto the reference's
+candidate -- a reminder that the tie is a coin, not a signal.
+
+gws 68.2 -> 23.5 ms, DAF[0] 206 -> 171, frame 371.2 -> 277.7.
+
+The stage that this leaves on top after grid_sample is the 27.3 ms concat that
+builds `feats`. Removing it means calling gws once per FPN level, which needs
+clp ordered level-outermost -- and level sits INSIDE camera in weights_fc's
+output, because the camera axis comes from how the linear's rows are grouped,
+not from a permutation this port can apply at load. An attempt to measure the
+per-level form hung the device, so there is no number for it yet.
+
 ### grid_precompute, and what a "row" is allowed to mean
 
 The chain the soft-float finding points at is grid_compact -> grid_precompute
