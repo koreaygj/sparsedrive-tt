@@ -34,7 +34,7 @@ loss stay out of the port.
 
 ## Phase 2 order
 
-1. ResNet-34 + FPN — safest start, floor PCC 0.999
+1. ResNet-34 + FPN — **done**, 0.9993-0.9998 across the four FPN levels
 2. MHA / FFN / LayerNorm — port existing modules, only token counts differ
 3. **DFA** — the body of the project
 4. top-k filter + gather — reuse `topk_select` / `row_gather`
@@ -101,6 +101,35 @@ Worth paying: the softmax already emits the compact layout, so nothing is
 rearranged between softmax and gws, and compact moves a quarter of the traffic
 the 3D form does. `poc_dfa_full.py` validates k up front and names the legal
 values rather than letting TT_FATAL surface from inside the kernel.
+
+### Conv is a layout problem, not an arithmetic one
+
+Nothing in the backbone needed a precision decision. Sixteen BasicBlocks and
+eight FPN convs run at 0.9993-0.9998 with bf16 weights and activations
+throughout, and BatchNorm folds into the preceding conv exactly (36 ops gone,
+no accuracy cost). Every obstacle was memory layout or allocation:
+
+| symptom | cause | fix |
+|---|---|---|
+| `L1_SMALL buffer ... bank size is 0 B` | `open_device` defaults `l1_small_size=0`; conv2d allocates there | pass 24576 |
+| `Conv2d supports Height/Block/Width ... got INTERLEAVED` | `shard_layout=None` copied from sparse4D-tt | HEIGHT_SHARDED |
+| `Tiled input must be tile-aligned` | a sharded TILE conv output fed to `ttnn.upsample` | via ROW_MAJOR in DRAM |
+| circular buffers 1.9 MB at ResNet layer4 | 8x16 spatial, 512 channels: few rows per core carrying every channel's weights | BLOCK_SHARDED for that stage |
+| circular buffers 1.7 MB at FPN layer0 | **L1 slicing**, see below | `slice_l1=False` |
+
+**`Conv2dL1FullSliceConfig` is not a safety net.** It reads like one -- slice
+if it does not fit -- and sparse4D-tt leaves it on, but on FPN layer0 (3x3,
+256->256, 3x64x128 rows) enabling it is what overflows L1. Measured over 24
+combinations, `slice_l1=False` passes all of them and is the only variable that
+decides; block sharding and `act_block_h_override` only matter while slicing is
+on. Sharding alone never fixes that conv -- it fails under Height, Block and
+Width equally.
+
+Two attempts went in before that was known (block sharding everywhere, then
+capping the activation block), and both left the error size unchanged to the
+byte. An unchanged error size is the signal that the knob being turned is not
+attached to anything: stop and decompose. An 8x3 conv-by-sharding matrix found
+the culprit in one run, and a 24-point sweep of that one conv found the knob.
 
 ### Measurement discipline
 
