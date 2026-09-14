@@ -54,7 +54,8 @@ saw on a real navtest frame.
 | `grid_sample` | **done** | 0.9998 per level |
 | assemble to `[clp, N, E]` | **done**, no host round-trip | |
 | `grouped_weighted_sum` | **done** | 0.999822 |
-| `output_proj` | not started | |
+| `output_proj` | **done** | |
+| **whole module, end to end** | **done** | **0.999869** |
 
 Moving the assembly onto the device took the chunk from 1272 ms to 366 ms, and
 the host side from 439 ms to 12 ms, at the same accuracy.
@@ -87,6 +88,19 @@ the host side from 439 ms to 12 ms, at the same accuracy.
   xy, so z is a per-h constant and the homogeneous 4th is 1, which lets stock
   ops do the same fusion. Nothing ever materialises [n, 500, 3] — everything
   stays [n, 500], which tiles without wasting 29 of every 32 columns.
+
+### COMPACT weights constrain the clp split
+
+gws takes weights either as 3D `[clp, N, G]` or COMPACT `[N, clp*G]`, and the
+compact form needs `clp*G` to be a multiple of the tile width. With G = 8 that
+means the clp slice must be divisible by 4, so clp = 6000 accepts k = 10 (600)
+and rejects k = 8 (750). The 3D layout has no such rule, which is why the
+earlier gws PoC ran k = 8 happily.
+
+Worth paying: the softmax already emits the compact layout, so nothing is
+rearranged between softmax and gws, and compact moves a quarter of the traffic
+the 3D form does. `poc_dfa_full.py` validates k up front and names the legal
+values rather than letting TT_FATAL surface from inside the kernel.
 
 ### Measurement discipline
 
