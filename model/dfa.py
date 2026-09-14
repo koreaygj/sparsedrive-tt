@@ -184,18 +184,27 @@ class TtDFA:
         ttnn.deallocate(e); ttnn.deallocate(sb)
         return w
 
-    def __call__(self, feat, anchor, levels_tt, proj, iwh, chunk=512, splits=None):
+    def __call__(self, feat, anchor, levels_tt, proj, iwh, chunk=1024, splits=None):
         """feat [n, E] torch, anchor [n, num_sample*2] torch. -> [n, E] torch.
 
-        chunk 512 rather than 128: measured on DAF[0], with PCC identical to
-        six decimals throughout, the anchor block size is worth 1.76x.
+        Big blocks. Measured on DAF[0], PCC identical to six decimals at every
+        size -- the arithmetic does not change, only how often the launch and
+        the slicing are re-paid:
 
-            chunk   64  1488.5 ms      chunk  256   935.7 ms
-            chunk  128  1116.1 ms      chunk  512   844.1 ms
+            chunk   single    mesh(1,2)   per-chip [clp,m,E]
+              256    944.5      663.7      750 / 375 MB
+              512    857.6      555.9     1500 / 750 MB
+             1024    794.7      492.7     3000 / 1500 MB
 
-        Smaller blocks re-pay the kernel launch and the slicing per block; the
-        arithmetic does not change. Bounded above by L1 and by the [clp, m, E]
-        buffer, which at 512 anchors and clp 6000 is 786 MB in bf16.
+        1024 is every anchor of the layer-0 path branch in one block, which
+        means the [clp, m, E] buffer this file's header calls impossible to
+        materialise -- 2.93 GiB -- is in fact materialised, and is faster that
+        way. A 12 GB chip has room; the chunking overhead cost more than the
+        bandwidth did. The header's claim was an overstatement: the tensor
+        cannot fit in L1, not that it cannot exist.
+
+        Returns are diminishing (1.10x then 1.08x single, 1.19x then 1.13x on
+        mesh), so this is the end of the free lunch.
         """
         n = feat.shape[0]
         if splits is None:

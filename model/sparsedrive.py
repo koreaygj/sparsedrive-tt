@@ -16,8 +16,9 @@ import sys
 import torch
 import ttnn
 
-from .attention import TtFFN, _t, HIFI
+from .attention import TtFFN, _t, to_host, HIFI
 from .decoder import TtDecoder
+from .attention import _mapper
 from .fpn import TtFPN, preprocess as pre_fpn
 from .resnet34 import TtResNet34, preprocess as pre_res
 
@@ -49,13 +50,18 @@ class TtSparseDrive:
         x = torch.nn.functional.pad(imgs.permute(0, 2, 3, 1), (0, 1))
         xt = ttnn.from_torch(x.reshape(1, 1, self.C * self.H * self.W, 4).contiguous(),
                              dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT,
-                             device=self.dev)
+                             device=self.dev, mesh_mapper=_mapper(self.dev)[1])
         outs = self.fpn(self.backbone(xt))
         levels, last = [], None
         for (t, h, w, c) in outs:
-            v = ttnn.to_torch(t).float().reshape(self.C, h, w, c)
-            levels.append(ttnn.from_torch(v.contiguous(), layout=ttnn.ROW_MAJOR_LAYOUT,
-                                          device=self.dev, dtype=ttnn.bfloat16))
+            # conv output is [1, 1, N, C]; on a mesh the composer stacks both
+            # replicas on dim 0, so flatten to rows first and then take one
+            # copy's worth. Slicing dim 0 directly would slice a length-1 axis.
+            v = to_host(t, self.dev).float().reshape(-1, c)[:self.C * h * w]
+            v = v.reshape(self.C, h, w, c)
+            levels.append(ttnn.from_torch(
+                v.contiguous(), layout=ttnn.ROW_MAJOR_LAYOUT, device=self.dev,
+                dtype=ttnn.bfloat16, mesh_mapper=_mapper(self.dev)[1]))
             last = v
         # image tokens for the velocity branch's cross-attention: the coarsest
         # level, cams x h x w flattened
@@ -63,14 +69,15 @@ class TtSparseDrive:
 
     def __call__(self, imgs, status_feature, proj, iwh):
         levels, img_value = self.features(imgs)
-        status = ttnn.to_torch(ttnn.linear(_t(status_feature.reshape(1, -1), self.dev),
-                                           self.w_st, bias=self.b_st,
-                                           compute_kernel_config=self.cfg)).float()[0, :256]
+        status = to_host(ttnn.linear(_t(status_feature.reshape(1, -1), self.dev),
+                                     self.w_st, bias=self.b_st,
+                                     compute_kernel_config=self.cfg),
+                         self.dev).float()[0, :256]
         n_path = self.path_vocab.shape[0]
-        pe = ttnn.to_torch(self.path_pos(
-            _t(self.path_vocab.reshape(n_path, -1), self.dev))).float()[:n_path]
+        pe = to_host(self.path_pos(
+            _t(self.path_vocab.reshape(n_path, -1), self.dev)), self.dev).float()[:n_path]
         n_vel = self.vel_vocab.shape[0]
-        ve = ttnn.to_torch(self.vel_pos(
-            _t(self.vel_vocab, self.dev))).float()[:n_vel]
+        ve = to_host(self.vel_pos(
+            _t(self.vel_vocab, self.dev)), self.dev).float()[:n_vel]
         return self.decoder(pe, ve, self.path_vocab, self.traj_vocab, status,
                             levels, img_value, proj, iwh)

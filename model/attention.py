@@ -25,9 +25,28 @@ HIFI = dict(math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True,
             packer_l1_acc=True)
 
 
+_MESH = {}
+
+
+def _mapper(device):
+    """Cache the replicate mapper per device; building one per call is wasteful."""
+    if id(device) not in _MESH:
+        from .mesh import mesh_of
+        _MESH[id(device)] = mesh_of(device)
+    return _MESH[id(device)]
+
+
 def _t(x, device, dtype=ttnn.bfloat16):
+    _, rep, _ = _mapper(device)
     return ttnn.from_torch(x.contiguous(), layout=ttnn.TILE_LAYOUT,
-                           device=device, dtype=dtype)
+                           device=device, dtype=dtype, mesh_mapper=rep)
+
+
+def to_host(t, device):
+    """Compose a replicated tensor back. Callers slice [:T], which also
+    discards the second copy."""
+    _, _, cat = _mapper(device)
+    return ttnn.to_torch(t, mesh_composer=cat) if cat else ttnn.to_torch(t)
 
 
 class TtMultiheadAttention:

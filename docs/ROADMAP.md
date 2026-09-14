@@ -22,12 +22,19 @@ trajectory the PyTorch reference does, bit for bit -- the output is a lookup
 from a frozen vocabulary, so equality means the same candidate won out of 400.
 
     imgs [3,3,256,512] -> ResNet-34 + FPN -> decoder -> trajectory [8,3]
-    1789.8 ms, max|d| 0.000e+00
 
-That timing is not a performance number. Every module boundary still converts
-through torch on the host, and inside the DFA the projected coordinates, the
-visibility mask and the gws partial sums all round-trip. The device-only part
-of the three DFA calls measures 1352 ms of it.
+    single (64 cores)   1066.1 ms     mesh(1,2) (128 cores)   721.6 ms
+
+2.48x from where the assembly landed (1789.8 ms), with the trajectory identical
+throughout -- none of it traded accuracy. Two changes, both measured:
+
+  - anchor block size, 128 -> 1024, worth 1.68x on its own
+  - the second chip, which had been idle for the whole port
+
+Every module boundary still converts through torch on the host, and inside the
+DFA the visibility mask and the gws partial sums round-trip. The remaining
+device time is real work: grid_sample plus assembly at 38% and gws at 37%,
+which is where sparse4D-tt spent custom kernels to reach 57 ms/frame.
 
 Two things remain before navtest: removing those round-trips, and feeding the
 model from the navsim pipeline rather than from golden tensors -- the

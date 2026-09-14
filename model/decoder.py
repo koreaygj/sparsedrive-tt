@@ -20,7 +20,7 @@ become 20 absolute path indices, and the vocabulary is sliced once at the end.
 import torch
 import ttnn
 
-from .attention import TtMultiheadAttention, TtFFN, _t
+from .attention import TtMultiheadAttention, TtFFN, _t, to_host
 from .dfa import TtDFA
 
 V1_METRICS = ["no_at_fault_collisions", "drivable_area_compliance",
@@ -70,8 +70,8 @@ class TtDecoderLayer:
         xt = _ln(xt, *self.norms[n1])
         xt = ttnn.add(xt, ffn(xt))
         xt = _ln(xt, *self.norms[n2])
-        scores = ttnn.to_torch(mlp(xt)).float()[:T, 0]
-        return ttnn.to_torch(xt).float()[:T], scores
+        scores = to_host(mlp(xt), self.dev).float()[:T, 0]
+        return to_host(xt, self.dev).float()[:T], scores
 
     def __call__(self, path_embed, vel_embed, path_anchor, status, levels,
                  img_tt, n_img, proj, iwh, k_path, k_vel):
@@ -99,7 +99,7 @@ class TtDecoderLayer:
         xt = _ln(xt, *self.norms["t_norm1"])
         xt = ttnn.add(xt, self.t_ffn(xt))
         xt = _ln(xt, *self.norms["t_norm2"])
-        lg = {m: ttnn.to_torch(h(xt)).float()[:T, 0] for m, h in self.heads.items()}
+        lg = {m: to_host(h(xt), self.dev).float()[:T, 0] for m, h in self.heads.items()}
         scores = (torch.sigmoid(lg["no_at_fault_collisions"])
                   * torch.sigmoid(lg["drivable_area_compliance"])) * (
             5 * torch.sigmoid(lg["time_to_collision_within_bound"])
