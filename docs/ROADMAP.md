@@ -309,6 +309,49 @@ on the host triples the grid upload and gives the win back. It has to be
 `ttnn.grid_precompute`, on device, which is why that op takes a compacted Q14
 grid and couples to `grid_compact`.
 
+### grid_precompute, and what a "row" is allowed to mean
+
+The chain the soft-float finding points at is grid_compact -> grid_precompute
+-> grid_sample(use_precomputed_grid). Only the last two are wired; the reason
+is worth recording.
+
+`grid_precompute` builds one 32-column coords tile per core and the reader
+fills 2*K of those columns, so a row carries at most **16 points**. sparse4D
+has 13 points an anchor, so there a row is an anchor. SparseDrive has 500, and
+the DFA's rows cannot be anchors.
+
+They do not have to be. Nothing in the op reads meaning into a row: regrouping
+the grid into 16-point rows that straddle anchors works, because grid_sample's
+K-batched output is (N, H, W*K, C) and flattens straight back to point order.
+That is the whole adaptation.
+
+What did have to change is the op's other limit. It assigned one coords tile
+per core, capping a call at 64 x 32 = 2048 rows, and SparseDrive's layer-0
+grid is 96,000. The window cannot be passed in -- a core's `row_start` is
+derived in the program factory -- so chunking outside the op would need its own
+output tensors per chunk and a concat of all of them. Each kernel now loops
+over the tiles its core was given, which leaves single-tile calls untouched
+(sparse4D's own verify still passes: h0/w0 exact, masks exact, weights within
+one bf16 rounding step).
+
+    grid_precompute   1.54M points x 4 levels     8.2 ms   (5.4 ns/point)
+    grid_sample x4    295.8 -> 64.3 ms                      4.08x together
+
+4.08x, against the 3.35x the host-precomputed measurement predicted -- K=16
+batching pays on top of removing the soft float. DAF[0] on mesh 324 -> 206 ms,
+frame 516.2 -> 371.2.
+
+Accuracy goes UP: Q14 resolves a coordinate finer than the bf16 grid it
+replaces. DFA PCC 0.999925 / 0.999828 / 0.999986 against 0.999919 / 0.999817 /
+0.999987.
+
+`grid_compact` is still not wired, and the reason has changed. It was going to
+pay by dropping ~68% of the rows from grid_sample; with grid_sample down to
+68 ms that is worth ~46 ms, and it also shrinks gws. But its `flags` are per
+(camera, anchor) and this model's mask is per (camera, point), so flags do not
+substitute for the mask -- and the mask now costs 1.7 ms, so removing the host
+round trip is worth about 10 ms, not the 161 an early profile suggested.
+
 ### The mask's layout, not its size, was what made it expensive
 
 The DFA mask depends on camera and point only. Under the checkpoint's
@@ -520,7 +563,20 @@ hardware would flip too, the same way Phase 1's top-k ranking differed between
 CPU and GPU.
 
 A flip is also not obviously a wrong answer — candidates 180 and 20 are
-equivalent by the model's own metric. What it costs is a PDMS question, and
+equivalent by the model's own metric.
+
+Seen again in Phase 3, and this is what it looks like from the outside. After
+the grid moved to Q14, the single device still reproduced the reference
+trajectory bit for bit while the mesh did not, by 5.73e-02:
+
+    single  argmax  3   11.991166 vs 11.991146   relative margin 1.67e-06
+    mesh    argmax 23   11.991146 vs 11.990950   relative margin 1.64e-05
+
+The same two candidates, swapped. Nothing was wrong with either run — the
+model does not separate them, and the mesh differs from the single device
+anyway because gws accumulates 512 anchors instead of 1024 (DFA output PCC
+1.00000000, max 3.1e-02). **A single frame's trajectory match is not a
+regression test for this port.** PDMS is. What it costs is a PDMS question, and
 **Phase 3 should expect end-to-end PDMS to differ from PyTorch for this reason
 rather than from accumulated error.** Measure it before explaining it.
 
