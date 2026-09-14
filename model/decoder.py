@@ -116,13 +116,13 @@ class TtDecoder:
                        for i in range(2)]
 
     def __call__(self, path_embed, vel_embed, path_vocab, traj_vocab, status,
-                 levels, img_value, proj, iwh):
+                 levels, img_tt, n_img, proj, iwh):
         """Returns the selected trajectory [num_poses, 3].
 
-        img_value is the last FPN level flattened to image tokens:
-        [cams, C, H, W] -> [cams*H*W, C] = [384, 256] here.
+        img_tt is the last FPN level flattened to image tokens, already on
+        device: [cams*H*W, C] = [384, 256] here, and n_img is that first
+        dimension.
         """
-        img_tt, n_img = _t(img_value, self.dev), img_value.shape[0]
         p_abs = torch.arange(path_embed.shape[0])
         v_abs = torch.arange(vel_embed.shape[0])
         for i, layer in enumerate(self.layers):

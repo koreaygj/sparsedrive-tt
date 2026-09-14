@@ -55,21 +55,31 @@ class TtSparseDrive:
         outs = self.fpn(self.backbone(xt))
         levels, last = [], None
         for (t, h, w, c) in outs:
-            # conv output is [1, 1, N, C]; on a mesh the composer stacks both
-            # replicas on dim 0, so flatten to rows first and then take one
-            # copy's worth. Slicing dim 0 directly would slice a length-1 axis.
-            v = to_host(t, self.dev).float().reshape(-1, c)[:self.C * h * w]
-            v = v.reshape(self.C, h, w, c)
-            levels.append(ttnn.from_torch(
-                v.bfloat16().contiguous(), layout=ttnn.ROW_MAJOR_LAYOUT, device=self.dev,
-                dtype=ttnn.bfloat16, mesh_mapper=_mapper(self.dev)[1]))
-            last = v
+            # The conv output is [1, 1, N, C] and the DFA wants [cams, h, w, C].
+            # This used to go through the host -- 31.9 MB down and 15.9 MB back
+            # up, 23.7 ms -- and the reason was the mesh: to_host composes the
+            # replicas onto dim 0, so the caller flattened and took one copy's
+            # worth. But the tensor is REPLICATED, so every device already holds
+            # the whole thing and there is nothing to compose: N is exactly
+            # cams*h*w on all four levels, with no padding at all, and the
+            # reshape is a reshape.
+            #
+            # ROW_MAJOR first, then reshape: [cams, h, w, C] puts h*w in the
+            # second-to-last position and the coarsest level's is 16, which a
+            # TILE tensor would pad to 32.
+            v = t
+            if v.memory_config().memory_layout != ttnn.TensorMemoryLayout.INTERLEAVED:
+                v = ttnn.sharded_to_interleaved(v, ttnn.DRAM_MEMORY_CONFIG)
+            levels.append(ttnn.reshape(
+                ttnn.to_layout(v, ttnn.ROW_MAJOR_LAYOUT), (self.C, h, w, c)))
+            last = (v, h, w, c)
         # image tokens for the velocity branch's cross-attention: the coarsest
-        # level, cams x h x w flattened
-        return levels, last.reshape(-1, last.shape[-1])
+        # level, cams x h x w flattened. It stays TILE -- attention matmuls it.
+        v, h, w, c = last
+        return levels, ttnn.reshape(v, (self.C * h * w, c)), self.C * h * w
 
     def __call__(self, imgs, status_feature, proj, iwh):
-        levels, img_value = self.features(imgs)
+        levels, img_tt, n_img = self.features(imgs)
         status = to_host(ttnn.linear(_t(status_feature.reshape(1, -1), self.dev),
                                      self.w_st, bias=self.b_st,
                                      compute_kernel_config=self.cfg),
@@ -81,4 +91,4 @@ class TtSparseDrive:
         ve = to_host(self.vel_pos(
             _t(self.vel_vocab, self.dev)), self.dev).float()[:n_vel]
         return self.decoder(pe, ve, self.path_vocab, self.traj_vocab, status,
-                            levels, img_value, proj, iwh)
+                            levels, img_tt, n_img, proj, iwh)
