@@ -223,6 +223,7 @@ class TtDFA:
         self.Ax, self.Ay = T(Ax, ttnn.float32), T(Ay, ttnn.float32)
         self.zc = torch.tensor([FIX_HEIGHT[(p // Lp) % H] for p in range(P)])
         self._consts, self._consts_key = None, None
+        self.pc_tt = None
         self.clp_l = num_cams * self.P
         self.nchunks = max(k for k in (GWS_CHUNKS, 25, 20, 15, 12, 10, 8, 6, 5, 4, 3, 2, 1)
                            if self.clp_l % k == 0)
@@ -235,6 +236,33 @@ class TtDFA:
             layout=ttnn.ROW_MAJOR_LAYOUT, device=self.dev, dtype=ttnn.bfloat16,
             mesh_mapper=self.rep)
             for (h, w), s in zip(shapes, starts)]
+
+    def prepare_proj(self, proj, iwh):
+        """Per-frame projection constants, as ONE device tensor.
+
+        They used to reach the ops as Python floats -- ttnn.multiply(x, 0.87)
+        -- which bakes them into the program. A trace replays the program it
+        recorded, so the first frame's camera matrix would be used for every
+        frame after it. As tensor rows they live in a buffer the caller can
+        refill, which is what makes the DFA traceable.
+
+        Rows are k * (C*3) + c*3 + i:
+            k=0  a    the x coefficient of plane i of camera c
+            k=1  b    the y coefficient
+            k=2  cst  zc * P[i,2] + P[i,3], the per-point constant
+            k=3       1/width and 1/height in i=0 and i=1
+        """
+        R = self.C * 3
+        blk = torch.zeros(4, R, self.P)
+        for c in range(self.C):
+            Pm = proj[c]
+            for i in range(3):
+                blk[0, c * 3 + i] = float(Pm[i, 0])
+                blk[1, c * 3 + i] = float(Pm[i, 1])
+            blk[2, c * 3:c * 3 + 3] = (Pm[:3, 2] * self.zc.unsqueeze(-1) + Pm[:3, 3]).t()
+            blk[3, c * 3 + 0] = 1.0 / float(iwh[c, 0])
+            blk[3, c * 3 + 1] = 1.0 / float(iwh[c, 1])
+        self.pc_tt = self.T(blk.reshape(4 * R, self.P), self.f32)
 
     def _gp_pack(self, levels_tt):
         key = tuple((int(t.shape[1]), int(t.shape[2])) for t in levels_tt)
@@ -282,27 +310,25 @@ class TtDFA:
         y = ttnn.add(ttnn.matmul(off, self.Oy, compute_kernel_config=self.hi),
                      ttnn.matmul(anchor32, self.Ay, compute_kernel_config=self.hi))
         ttnn.deallocate(off)
-        cst_all = torch.stack(
-            [(proj[c][:3, 2] * self.zc.unsqueeze(-1) + proj[c][:3, 3]).t()
-             for c in range(self.C)], 0).reshape(self.C * 3, self.P)
-        cst_tt = self.T(cst_all, self.f32)
+        pc = self.pc_tt
+        R = self.C * 3
+        row = lambda k, c, i: ttnn.slice(pc, [k * R + c * 3 + i, 0],
+                                         [k * R + c * 3 + i + 1, self.P])
         us, vs = [], []
         for c in range(self.C):
-            Pm = proj[c]
-            cx, cy, cz = (ttnn.slice(cst_tt, [c * 3 + i, 0], [c * 3 + i + 1, self.P])
-                          for i in range(3))
-            X = ttnn.add(ttnn.add(ttnn.multiply(x, float(Pm[0, 0])),
-                                  ttnn.multiply(y, float(Pm[0, 1]))), cx)
-            Y = ttnn.add(ttnn.add(ttnn.multiply(x, float(Pm[1, 0])),
-                                  ttnn.multiply(y, float(Pm[1, 1]))), cy)
-            Z = ttnn.clamp(ttnn.add(ttnn.add(ttnn.multiply(x, float(Pm[2, 0])),
-                                             ttnn.multiply(y, float(Pm[2, 1]))), cz),
-                           1e-5, 1e30)
-            us.append(ttnn.multiply(ttnn.divide(X, Z), 1.0 / float(iwh[c, 0])))
-            vs.append(ttnn.multiply(ttnn.divide(Y, Z), 1.0 / float(iwh[c, 1])))
-            for q in (cx, cy, cz, X, Y, Z):
+            ax, bx, cx = (row(k, c, 0) for k in range(3))
+            ay, by, cy = (row(k, c, 1) for k in range(3))
+            az, bz, cz = (row(k, c, 2) for k in range(3))
+            iw, ih = row(3, c, 0), row(3, c, 1)
+            X = ttnn.add(ttnn.add(ttnn.multiply(x, ax), ttnn.multiply(y, bx)), cx)
+            Y = ttnn.add(ttnn.add(ttnn.multiply(x, ay), ttnn.multiply(y, by)), cy)
+            Z = ttnn.clamp(ttnn.add(ttnn.add(ttnn.multiply(x, az),
+                                             ttnn.multiply(y, bz)), cz), 1e-5, 1e30)
+            us.append(ttnn.multiply(ttnn.divide(X, Z), iw))
+            vs.append(ttnn.multiply(ttnn.divide(Y, Z), ih))
+            for q in (ax, bx, cx, ay, by, cy, az, bz, cz, iw, ih, X, Y, Z):
                 ttnn.deallocate(q)
-        ttnn.deallocate(x); ttnn.deallocate(y); ttnn.deallocate(cst_tt)
+        ttnn.deallocate(x); ttnn.deallocate(y)
 
         uv = ttnn.concat(us + vs, dim=0)
         q = _q14_bits(uv)
@@ -500,6 +526,8 @@ class TtDFA:
             f"{GP_K}-point grid rows")
         cam = self._camera_embed(proj_tt)
         consts = self._gp_pack(levels_tt)
+        if getattr(self, "pc_tt", None) is None:
+            self.prepare_proj(proj, iwh)
         outs = []
         for a0 in range(0, n, chunk):
             a1 = min(a0 + chunk, n)
