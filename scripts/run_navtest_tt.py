@@ -36,6 +36,27 @@ takes auto-discovery instead, auto-discovery does not recognise this
 motherboard, and the E/W routing planes are never registered -- which is what
 get_num_usable_routing_planes reads. model/mesh.py's enable_fabric refuses
 without the variable rather than let that happen.
+
+ON A HANG the device is deliberately NOT closed. Closing a mesh that has
+already timed out times out a second time, inside FDMeshCommandQueue's
+destructor, and a throwing destructor calls terminate: the process core-dumps
+and the board will not initialise again until tt-smi -r. Leaking the handle out
+of a dying process costs nothing next to that. What ran is saved either way and
+--resume picks it up; reset the board first.
+
+The hang itself is not understood. It has landed at 50, 675, 1250, 1675, 3050,
+5975 and 7350 tokens, always as "device timeout in fetch queue wait". --fabric
+makes it far more frequent but is not the cause: a run without it died at 7350.
+Two theories were tested and dropped -- the prefetch loader (a sequential run
+died the same way) and a stale TT_METAL_HOME pairing this tree's host library
+with another checkout's kernels (fixed in env.sh; a run with it corrected still
+died, at 3050). To go further:
+
+    export TT_METAL_DISPATCH_TIMEOUT_COMMAND_TO_EXECUTE="<tt-triage.py>"
+
+which runs triage against the live device at the moment of the hang. Triage
+says itself that it needs the host process still up; the dump written
+afterwards is not enough.
 """
 
 import argparse
@@ -140,8 +161,13 @@ def main():
                     report(i)
         torch.save(done, out)
         print(f"  saved {len(done)} -> {out}", flush=True)
-    finally:
-        (ttnn.close_device if args.single else ttnn.close_mesh_device)(dev)
+    except BaseException:
+        torch.save(done, out)
+        print(f"  saved {len(done)} -> {out}", flush=True)
+        print("  device left open: closing a hung mesh aborts the process. "
+              "Run tt-smi -r before resuming.", flush=True)
+        raise
+    (ttnn.close_device if args.single else ttnn.close_mesh_device)(dev)
     return 0
 
 
