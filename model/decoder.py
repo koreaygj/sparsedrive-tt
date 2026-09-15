@@ -122,8 +122,8 @@ class TtDecoderLayer:
         ttnn.deallocate(sc)
         return xt, row
 
-    def __call__(self, path_embed, vel_embed, path_anchor, status, levels,
-                 img_tt, n_img, proj, proj_tt, iwh, k_path, k_vel):
+    def __call__(self, path_embed, vel_embed, path_anchor, p_abs, v_abs, status,
+                 levels, img_tt, n_img, proj, proj_tt, iwh, k_path, k_vel):
         path_embed = ttnn.add(path_embed, status)
         vel_embed = ttnn.add(vel_embed, status)
         p_out, p_scores = self._branch(
@@ -143,14 +143,17 @@ class TtDecoderLayer:
         pi_tt = _topk(self.dev, p_scores, k_path)
         vi_tt = _topk(self.dev, v_scores, k_vel)
         p_sel, a_sel = _gather2(self.dev, p_out, path_anchor, pi_tt, k_path)
-        v_sel, _ = _gather2(self.dev, v_out, None, vi_tt, k_vel)
+        v_sel, va_sel = _gather2(self.dev, v_out, v_abs, vi_tt, k_vel)
         # The indices DO come back, 80 bytes of them, because the final answer
         # is a row of traj_vocab and picking it is a host index either way.
-        pi = to_host(pi_tt, self.dev).reshape(-1)[:k_path].long()
-        vi = to_host(vi_tt, self.dev).reshape(-1)[:k_vel].long()
+        # The absolute vocabulary index is gathered by the same indices. The
+        # path branch needs its own call -- row_gather carries two pairs and
+        # that branch already uses both -- and the velocity branch has a spare
+        # slot, so its index rides with its embedding.
+        pa_sel, _ = _gather2(self.dev, p_abs, None, pi_tt, k_path)
         for t in (p_scores, v_scores, pi_tt, vi_tt):
             ttnn.deallocate(t)
-        return p_sel, v_sel, a_sel, pi, vi
+        return p_sel, v_sel, a_sel, pa_sel, va_sel
 
     def trajectory(self, p_emb, v_emb, traj_anchor, levels, proj, proj_tt, iwh):
         """Last layer only: 20 paths x 20 velocities -> 400 candidates.
@@ -193,8 +196,10 @@ class TtDecoderLayer:
         inner = ttnn.add(ttnn.add(ttnn.multiply(sg[2], 5.0), ttnn.multiply(sg[3], 5.0)),
                          ttnn.multiply(sg[4], 2.0))
         sc = ttnn.multiply(ttnn.multiply(sg[0], sg[1]), inner)
-        best = int(to_host(ttnn.argmax(ttnn.reshape(sc, (1, T)), dim=-1), self.dev)
-                   .reshape(-1)[0])
+        # ttnn.argmax hands back [1] uint32 ROW_MAJOR, which is exactly a
+        # row_gather index -- so the winner is picked on device too and the
+        # only thing that comes back is the trajectory itself.
+        best = ttnn.argmax(ttnn.reshape(sc, (1, T)), dim=-1)
         for t in cols + sg + [inner, sc]:
             ttnn.deallocate(t)
         return best
@@ -207,8 +212,9 @@ class TtDecoder:
         self.layers = [TtDecoderLayer(sd, prefix + f"layers.{i}.", device, i, i == 1)
                        for i in range(2)]
 
-    def __call__(self, path_embed, vel_embed, anchor_tt, traj_vocab, status,
-                 levels, img_tt, n_img, proj, proj_tt, iwh):
+    def __call__(self, path_embed, vel_embed, anchor_tt, status,
+                 levels, img_tt, n_img, proj, proj_tt, iwh,
+                 tv_all, tv_xy, p_abs0, v_abs0, n_vel, poses):
         """Returns the selected trajectory [num_poses, 3].
 
         Everything but the scores and the final answer stays on device.
@@ -216,22 +222,31 @@ class TtDecoder:
         it is a checkpoint constant -- and each layer's anchor is the previous
         one gathered by that layer's survivors, never re-derived on the host.
         """
-        p_abs = torch.arange(path_embed.shape[0])
-        v_abs = torch.arange(vel_embed.shape[0])
-        anchor = anchor_tt
+        anchor, p_abs, v_abs = anchor_tt, p_abs0, v_abs0
         for i, layer in enumerate(self.layers):
-            path_embed, vel_embed, anchor, pi, vi = layer(
-                path_embed, vel_embed, anchor, status, levels, img_tt, n_img,
-                proj, proj_tt, iwh, self.pf[i], self.vf[i])
-            # The absolute indices still compose on the host, for one reason:
-            # the final answer is a row of traj_vocab, and picking it is a
-            # host-side index either way.
-            p_abs, v_abs = p_abs[pi], v_abs[vi]
+            path_embed, vel_embed, anchor, p_abs, v_abs = layer(
+                path_embed, vel_embed, anchor, p_abs, v_abs, status, levels,
+                img_tt, n_img, proj, proj_tt, iwh, self.pf[i], self.vf[i])
 
-        last = self.layers[-1]
-        tv = traj_vocab[p_abs][:, v_abs]                    # [20, 20, poses, 3]
-        t_anchor = _t(tv[..., :2].reshape(-1, tv.shape[2] * 2), self.dev,
-                      dtype=ttnn.float32)                   # [400, poses*2]
-        best = last.trajectory(path_embed, vel_embed, t_anchor, levels,
-                               proj, proj_tt, iwh)
-        return tv.reshape(-1, tv.shape[2], tv.shape[3])[best]
+        n_p, n_v = self.pf[-1], self.vf[-1]
+        # flat[i*n_v + j] = p_abs[i] * n_vel + v_abs[j], the row of the
+        # flattened traj_vocab. fp32 holds it exactly -- the largest is
+        # 1023 * 256 + 255 = 262143 -- and the typecast is the last step.
+        flat = ttnn.add(ttnn.multiply(p_abs, float(n_vel)),
+                        ttnn.reshape(v_abs, (1, n_v)))          # [n_p, n_v]
+        fi = ttnn.to_layout(
+            ttnn.typecast(ttnn.reshape(flat, (1, 1, 1, n_p * n_v)), ttnn.uint32),
+            ttnn.ROW_MAJOR_LAYOUT)
+        # One row_gather takes the anchor and the candidate poses together.
+        t_anchor = _like(self.dev, tv_xy, n_p * n_v)
+        cands = _like(self.dev, tv_all, n_p * n_v)
+        ttnn.row_gather(tv_xy, fi, t_anchor, tv_all, cands, n_p * n_v)
+        best = self.layers[-1].trajectory(path_embed, vel_embed, t_anchor, levels,
+                                          proj, proj_tt, iwh)
+        # The winning row, and nothing else, comes back.
+        win = _like(self.dev, cands, 1)
+        ttnn.row_gather(cands, best, win, None, None, 1)
+        out = to_host(win, self.dev).float()[0].reshape(poses, 3)
+        for t in (flat, fi, t_anchor, cands, best, win):
+            ttnn.deallocate(t)
+        return out

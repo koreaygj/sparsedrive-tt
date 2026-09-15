@@ -46,11 +46,28 @@ class TtSparseDrive:
         self.decoder = TtDecoder(sd, T + "decoder.", device)
         # Checkpoint constants: the vocabularies and the path anchor never
         # change, so they go up once here instead of every frame.
-        n_path = self.path_vocab.shape[0]
+        n_path, n_vel = self.path_vocab.shape[0], self.vel_vocab.shape[0]
         self.pv_tt = _t(self.path_vocab.reshape(n_path, -1), device)
         self.vv_tt = _t(self.vel_vocab, device)
         self.anchor_tt = _t(self.path_vocab[..., :2].reshape(n_path, -1), device,
                             dtype=ttnn.float32)
+        # traj_vocab, flattened so one row_gather can reach any (path, vel)
+        # pair: row p*n_vel + v. fp32 for both, because one of them IS the
+        # answer -- the trajectory the model returns -- and the other is
+        # geometry. 40 MB a chip, once, against 20 KB a frame of host traffic.
+        tv = self.traj_vocab                            # [n_path, n_vel, poses, 3]
+        self.poses = tv.shape[2]
+        self.tv_all = _t(tv.reshape(n_path * n_vel, -1), device, dtype=ttnn.float32)
+        self.tv_xy = _t(tv[..., :2].reshape(n_path * n_vel, -1), device,
+                        dtype=ttnn.float32)
+        # The absolute vocabulary index rides along as a [T, 1] column, gathered
+        # by the same top-k indices as everything else, so the host never has to
+        # compose it.
+        self.p_abs0 = _t(torch.arange(n_path).float().reshape(-1, 1), device,
+                         dtype=ttnn.float32)
+        self.v_abs0 = _t(torch.arange(n_vel).float().reshape(-1, 1), device,
+                         dtype=ttnn.float32)
+        self.n_vel = n_vel
 
     def features(self, imgs):
         """imgs [cams, 3, H, W] -> per-level ttnn NHWC + the image tokens."""
@@ -103,5 +120,7 @@ class TtSparseDrive:
         ve = self.vel_pos(self.vv_tt)
         # proj[:, :3] goes up once for all three DFA instances.
         proj_tt = _t(proj[:, :3].reshape(self.C, -1), self.dev)
-        return self.decoder(pe, ve, self.anchor_tt, self.traj_vocab, status,
-                            levels, img_tt, n_img, proj, proj_tt, iwh)
+        return self.decoder(pe, ve, self.anchor_tt, status, levels, img_tt, n_img,
+                            proj, proj_tt, iwh,
+                            self.tv_all, self.tv_xy, self.p_abs0, self.v_abs0,
+                            self.n_vel, self.poses)
