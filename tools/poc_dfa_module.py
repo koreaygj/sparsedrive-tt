@@ -58,9 +58,13 @@ def main():
             # call first read 5613 ms for a sixteenth of layer 0's work.
             CH = 128
             proj_tt = dfa.T(proj[:, :3].reshape(dfa.C, -1))
-            dfa(feat, anchor, levels, proj, proj_tt, iwh, chunk=CH)
+            # feat/anchor now arrive on device, replicated; the DFA shards them
+            # itself with ttnn.mesh_partition.
+            f_tt = dfa.T(feat)
+            a_tt = dfa.T(anchor, ttnn.float32)
+            dfa(f_tt, a_tt, levels, proj, proj_tt, iwh, chunk=CH)
             ttnn.synchronize_device(dev); t0 = time.time()
-            got_tt = dfa(feat, anchor, levels, proj, proj_tt, iwh, chunk=CH)
+            got_tt = dfa(f_tt, a_tt, levels, proj, proj_tt, iwh, chunk=CH)
             ttnn.synchronize_device(dev); dt = (time.time() - t0) * 1e3
             # the DFA returns a device tensor now, gathered to every chip
             got = dfa.G2T(got_tt).float()[:n]

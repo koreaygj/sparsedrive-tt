@@ -28,6 +28,33 @@ V1_METRICS = ["no_at_fault_collisions", "drivable_area_compliance",
 ALL_METRICS = V1_METRICS + ["driving_direction_compliance"]
 
 
+def _idx(dev, i, k):
+    """[k] host indices -> [1, 1, 1, k] uint32 ROW_MAJOR, replicated."""
+    from .mesh import mesh_of
+    return ttnn.from_torch(i.to(torch.int32).reshape(1, 1, 1, k).contiguous(),
+                           layout=ttnn.ROW_MAJOR_LAYOUT, device=dev,
+                           dtype=ttnn.uint32, mesh_mapper=mesh_of(dev)[1])
+
+
+def _like(dev, src, k):
+    """A [k, width] gather destination. Allocated, not uploaded: row_gather
+    overwrites every row it is given, so zeroing it meant shipping 170 KB a
+    frame for nothing."""
+    return ttnn.allocate_tensor_on_device(
+        ttnn.TensorSpec(ttnn.Shape([k, src.shape[-1]]), src.dtype,
+                        ttnn.TILE_LAYOUT, ttnn.BufferType.DRAM), dev)
+
+
+def _gather2(dev, a, b, i, k):
+    """out_a[r] = a[i[r]], and the same for b when given. Bit-identical rows."""
+    it = _idx(dev, i, k)
+    oa = _like(dev, a, k)
+    ob = _like(dev, b, k) if b is not None else None
+    ttnn.row_gather(a, it, oa, b, ob, k)
+    ttnn.deallocate(it)
+    return oa, ob
+
+
 def _ln(x_t, w, b):
     return ttnn.layer_norm(x_t, weight=w, bias=b)
 
@@ -61,12 +88,13 @@ class TtDecoderLayer:
                 pre_attn=None, img=None, ti=None):
         """DFA -> (optional cross-attn) -> self-attn -> norm -> FFN -> norm -> score."""
         T = x.shape[0]
-        # The DFA hands back a device tensor, already gathered to every chip.
-        # Only the branch without one (velocity) still starts from the host.
-        if dfa is not None:
-            xt = dfa(x, anchor, levels, proj, proj_tt, iwh)
-        else:
-            xt = _t(x, self.dev)
+        # Everything stays on device. Only the SCORES come back, and only
+        # because the top-k has to stay torch.topk: ttnn.topk_select picks the
+        # same k values bit for bit but resolves ties to a different index, and
+        # a different survivor at the boundary is a different trajectory. The
+        # scores are 2 KB; the [T, 256] embedding they used to drag down with
+        # them was 1.4 MB.
+        xt = dfa(x, anchor, levels, proj, proj_tt, iwh) if dfa is not None else x
         if pre_attn is not None:      # velocity branch attends to image tokens first
             xt = ttnn.add(xt, pre_attn(xt, img, img, tq=T, tk=ti))
         xt = ttnn.add(xt, attn(xt, tq=T))
@@ -74,12 +102,12 @@ class TtDecoderLayer:
         xt = ttnn.add(xt, ffn(xt))
         xt = _ln(xt, *self.norms[n2])
         scores = to_host(mlp(xt), self.dev).float()[:T, 0]
-        return to_host(xt, self.dev).float()[:T], scores
+        return xt, scores
 
     def __call__(self, path_embed, vel_embed, path_anchor, status, levels,
                  img_tt, n_img, proj, proj_tt, iwh, k_path, k_vel):
-        path_embed = path_embed + status
-        vel_embed = vel_embed + status
+        path_embed = ttnn.add(path_embed, status)
+        vel_embed = ttnn.add(vel_embed, status)
         p_out, p_scores = self._branch(
             path_embed, self.p_dfa, path_anchor, levels, proj, proj_tt, iwh,
             self.p_attn, self.p_ffn, self.p_mlp, "p_norm1", "p_norm2")
@@ -89,18 +117,41 @@ class TtDecoderLayer:
             pre_attn=self.v_img, img=img_tt, ti=n_img)
         pi = torch.topk(p_scores, k_path).indices
         vi = torch.topk(v_scores, k_vel).indices
-        return p_out[pi], v_out[vi], pi, vi
+        # The survivors are selected on device. The path branch gathers its
+        # anchor alongside its embedding -- one row_gather carries both pairs --
+        # which is also what removes the anchor's own upload: layer i+1's
+        # anchor is layer i's gathered by the same indices, never re-derived
+        # from the vocabulary on the host.
+        p_sel, a_sel = _gather2(self.dev, p_out, path_anchor, pi, k_path)
+        v_sel, _ = _gather2(self.dev, v_out, None, vi, k_vel)
+        return p_sel, v_sel, a_sel, pi, vi
 
     def trajectory(self, p_emb, v_emb, traj_anchor, levels, proj, proj_tt, iwh):
-        """Last layer only: 20 paths x 20 velocities -> 400 candidates."""
+        """Last layer only: 20 paths x 20 velocities -> 400 candidates.
+
+        The outer sum runs on device: [n_p, 1, E] + [1, n_v, E] broadcast, then
+        flattened. p_emb and v_emb are what row_gather selected, so nothing has
+        touched the host since the FPN.
+        """
         n_p, n_v = p_emb.shape[0], v_emb.shape[0]
-        traj = (p_emb.unsqueeze(1) + v_emb.unsqueeze(0)).reshape(n_p * n_v, -1)
-        T = traj.shape[0]
+        E = p_emb.shape[-1]
+        traj = ttnn.reshape(
+            ttnn.add(ttnn.reshape(p_emb, (n_p, 1, E)), ttnn.reshape(v_emb, (1, n_v, E))),
+            (n_p * n_v, E))
+        T = n_p * n_v
         xt = self.t_dfa(traj, traj_anchor, levels, proj, proj_tt, iwh)
+        ttnn.deallocate(traj)
         xt = ttnn.add(xt, self.t_attn(xt, tq=T))
         xt = _ln(xt, *self.norms["t_norm1"])
         xt = ttnn.add(xt, self.t_ffn(xt))
         xt = _ln(xt, *self.norms["t_norm2"])
+        # The five logits come down and the score is composed on the HOST, in
+        # fp32. Assembling it on device instead was tried and changed the
+        # answer -- max|d| 2.3 on the trajectory, a different candidate. The
+        # top two candidates sit 1.7e-06 apart in relative terms and bf16
+        # carries about 4e-3, so the sigmoids and the weighted sum have to be
+        # done wider than the device does them by default. Five downloads of
+        # 2 KB is what that costs.
         lg = {m: to_host(h(xt), self.dev).float()[:T, 0] for m, h in self.heads.items()}
         scores = (torch.sigmoid(lg["no_at_fault_collisions"])
                   * torch.sigmoid(lg["drivable_area_compliance"])) * (
@@ -117,27 +168,31 @@ class TtDecoder:
         self.layers = [TtDecoderLayer(sd, prefix + f"layers.{i}.", device, i, i == 1)
                        for i in range(2)]
 
-    def __call__(self, path_embed, vel_embed, path_vocab, traj_vocab, status,
+    def __call__(self, path_embed, vel_embed, anchor_tt, traj_vocab, status,
                  levels, img_tt, n_img, proj, proj_tt, iwh):
         """Returns the selected trajectory [num_poses, 3].
 
-        img_tt is the last FPN level flattened to image tokens, already on
-        device: [cams*H*W, C] = [384, 256] here, and n_img is that first
-        dimension.
+        Everything but the scores and the final answer stays on device.
+        `anchor_tt` is path_vocab[..., :2] flattened, uploaded once at load --
+        it is a checkpoint constant -- and each layer's anchor is the previous
+        one gathered by that layer's survivors, never re-derived on the host.
         """
         p_abs = torch.arange(path_embed.shape[0])
         v_abs = torch.arange(vel_embed.shape[0])
+        anchor = anchor_tt
         for i, layer in enumerate(self.layers):
-            anchor = path_vocab[p_abs][..., :2].reshape(len(p_abs), -1)
-            path_embed, vel_embed, pi, vi = layer(
+            path_embed, vel_embed, anchor, pi, vi = layer(
                 path_embed, vel_embed, anchor, status, levels, img_tt, n_img,
                 proj, proj_tt, iwh, self.pf[i], self.vf[i])
-            # compose rather than gather: layer i selects within layer i-1's
-            # survivors, so indices into the original vocabulary chain.
+            # The absolute indices still compose on the host, for one reason:
+            # the final answer is a row of traj_vocab, and picking it is a
+            # host-side index either way.
             p_abs, v_abs = p_abs[pi], v_abs[vi]
 
         last = self.layers[-1]
         tv = traj_vocab[p_abs][:, v_abs]                    # [20, 20, poses, 3]
-        anchor = tv[..., :2].reshape(-1, tv.shape[2] * 2)   # [400, poses*2]
-        scores = last.trajectory(path_embed, vel_embed, anchor, levels, proj, proj_tt, iwh)
+        t_anchor = _t(tv[..., :2].reshape(-1, tv.shape[2] * 2), self.dev,
+                      dtype=ttnn.float32)                   # [400, poses*2]
+        scores = last.trajectory(path_embed, vel_embed, t_anchor, levels,
+                                 proj, proj_tt, iwh)
         return tv.reshape(-1, tv.shape[2], tv.shape[3])[int(scores.argmax())]

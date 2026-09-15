@@ -421,6 +421,31 @@ class TtDFA:
             ttnn.deallocate(t)
         return g_tt, base
 
+    def _rows(self, t, a0, a1):
+        """Rows [a0, a1) of a replicated device tensor, sharded by anchor.
+
+        mesh_partition is the inverse of the all_gather in _gather: each chip
+        keeps the i/nd-th slice. 0.17 ms at 1024 rows, and exact.
+        """
+        n = t.shape[0]
+        sl = t if (a0 == 0 and a1 == n) else ttnn.slice(t, [a0, 0], [a1, t.shape[-1]])
+        if self.nd == 1:
+            return sl if sl is not t else ttnn.clone(t)
+        # mesh_partition cuts a TILE tensor only on a tile boundary, and the
+        # trajectory branch's 400 rows split into 200 -- which is not one. The
+        # host mapper this replaced could cut anywhere. ROW_MAJOR has no such
+        # constraint, so an unaligned split goes through it and comes back.
+        if ((a1 - a0) // self.nd) % 32 == 0:
+            r = ttnn.mesh_partition(sl, 0)
+        else:
+            rm = ttnn.to_layout(sl, ttnn.ROW_MAJOR_LAYOUT)
+            pr = ttnn.mesh_partition(rm, 0)
+            r = ttnn.to_layout(pr, ttnn.TILE_LAYOUT)
+            ttnn.deallocate(rm); ttnn.deallocate(pr)
+        if sl is not t:
+            ttnn.deallocate(sl)
+        return r
+
     def _gather(self, res, m):
         """[ml, E] sharded by anchor -> [m, E] on every device.
 
@@ -548,13 +573,22 @@ class TtDFA:
             # feat goes up ONCE. The projection wants it fp32 -- coordinates are
             # geometry -- and everything else wants bf16, and uploading the same
             # rows twice cost an upload for nothing.
-            f32 = self.S(feat[a0:a1], self.f32)
+            # feat and anchor arrive REPLICATED on device; ttnn.mesh_partition
+            # is all_gather's inverse and hands each chip its own anchors, so
+            # neither has to be uploaded. The projection wants fp32 -- the
+            # coordinates are geometry -- and nothing is lost widening the bf16
+            # the decoder produced, which is what the host path uploaded too.
+            fr = self._rows(feat, a0, a1)
+            f32 = ttnn.typecast(fr, self.f32) if fr.dtype != ttnn.float32 else fr
             f_tt = ttnn.typecast(f32, ttnn.bfloat16)
-            # Nothing comes back to the host here: both the Q14 grid and the
-            # [ml, C*P] mask are built on device from u and v.
-            g_tt, base = self._project(f32, self.S(anchor[a0:a1], self.f32),
-                                       m, proj, iwh)
-            ttnn.deallocate(f32)
+            an = self._rows(anchor, a0, a1)
+            a32 = ttnn.typecast(an, self.f32) if an.dtype != ttnn.float32 else an
+            g_tt, base = self._project(f32, a32, m, proj, iwh)
+            if f32 is not fr:
+                ttnn.deallocate(f32)
+            if a32 is not an:
+                ttnn.deallocate(a32)
+            ttnn.deallocate(fr); ttnn.deallocate(an)
             Wl = self._weights(f_tt, cam, m, base)
             # h0, w0 and the four bilinear weights, per level, on the Tensix
             # engines -- 8 ms here against the 232 it takes grid_sample's reader

@@ -44,6 +44,13 @@ class TtSparseDrive:
         self.vel_vocab = sd[T + "vel_vocab"].float()
         self.traj_vocab = sd[T + "traj_vocab"].float()
         self.decoder = TtDecoder(sd, T + "decoder.", device)
+        # Checkpoint constants: the vocabularies and the path anchor never
+        # change, so they go up once here instead of every frame.
+        n_path = self.path_vocab.shape[0]
+        self.pv_tt = _t(self.path_vocab.reshape(n_path, -1), device)
+        self.vv_tt = _t(self.vel_vocab, device)
+        self.anchor_tt = _t(self.path_vocab[..., :2].reshape(n_path, -1), device,
+                            dtype=ttnn.float32)
 
     def features(self, imgs):
         """imgs [cams, 3, H, W] -> per-level ttnn NHWC + the image tokens."""
@@ -86,17 +93,15 @@ class TtSparseDrive:
 
     def __call__(self, imgs, status_feature, proj, iwh):
         levels, img_tt, n_img = self.features(imgs)
-        status = to_host(ttnn.linear(_t(status_feature.reshape(1, -1), self.dev),
-                                     self.w_st, bias=self.b_st,
-                                     compute_kernel_config=self.cfg),
-                         self.dev).float()[0, :256]
-        n_path = self.path_vocab.shape[0]
-        pe = to_host(self.path_pos(
-            _t(self.path_vocab.reshape(n_path, -1), self.dev)), self.dev).float()[:n_path]
-        n_vel = self.vel_vocab.shape[0]
-        ve = to_host(self.vel_pos(
-            _t(self.vel_vocab, self.dev)), self.dev).float()[:n_vel]
+        # The status encoding and the two positional embeddings stay on device;
+        # they used to come down only to be added on the host and sent back.
+        # [1, E] broadcasts over [T, E].
+        status = ttnn.linear(_t(status_feature.reshape(1, -1), self.dev),
+                             self.w_st, bias=self.b_st,
+                             compute_kernel_config=self.cfg)
+        pe = self.path_pos(self.pv_tt)
+        ve = self.vel_pos(self.vv_tt)
         # proj[:, :3] goes up once for all three DFA instances.
         proj_tt = _t(proj[:, :3].reshape(self.C, -1), self.dev)
-        return self.decoder(pe, ve, self.path_vocab, self.traj_vocab, status,
+        return self.decoder(pe, ve, self.anchor_tt, self.traj_vocab, status,
                             levels, img_tt, n_img, proj, proj_tt, iwh)
