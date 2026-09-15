@@ -45,7 +45,18 @@ export NAVSIM_EXP_ROOT="$SPARSEDRIVE_TT_ROOT/exp"
 mkdir -p "$NAVSIM_EXP_ROOT"
 
 # --- tenstorrent --------------------------------------------------------------
-export TT_METAL_HOME="${TT_METAL_HOME_OVERRIDE:-$HOME/project/tenstorrent/tt-metal}"
+# The venv's activate script exports TT_METAL_HOME=~/tt-metal, which is a
+# DIFFERENT checkout and does not carry this port's custom ops. Whichever is
+# sourced last wins, so say so loudly rather than let the two get paired: the
+# host library loads from this tree's build via RUNPATH while kernels are
+# JIT-compiled out of $TT_METAL_HOME, and a program factory expecting the
+# multi-tile grid_precompute against the old kernel hangs the device.
+_sd_want="${TT_METAL_HOME_OVERRIDE:-$HOME/project/tenstorrent/tt-metal}"
+if [ -n "$TT_METAL_HOME" ] && [ "$TT_METAL_HOME" != "$_sd_want" ]; then
+  echo "  note: TT_METAL_HOME was $TT_METAL_HOME, overriding with $_sd_want"
+fi
+export TT_METAL_HOME="$_sd_want"
+unset _sd_want
 export ARCH_NAME="${ARCH_NAME:-wormhole_b0}"
 
 # --- interpreters -------------------------------------------------------------
@@ -65,9 +76,13 @@ export TT_PY="${TT_PY:-$HOME/.tenstorrent-venv/bin/python}"
 # `import ttnn` resolve to an empty namespace package that silently has no ops).
 # shim/ holds sitecustomize.py, which Python imports at startup -- that is how
 # the deformable-aggregation stand-in reaches ray workers spawned by navsim.
+# Test the WHOLE prefix, not just one entry. The old guard checked only for
+# NAVSIM_DEVKIT_ROOT, so re-sourcing after TT_METAL_HOME changed left the
+# previous checkout's ttnn on the path -- the exact way host and device end up
+# on different versions of an op.
 _sd_pp="$SPARSEDRIVE_TT_ROOT/shim:$NAVSIM_DEVKIT_ROOT:$TT_METAL_HOME/ttnn:$TT_METAL_HOME:$TT_METAL_HOME/tools"
 case ":${PYTHONPATH}:" in
-  *":$NAVSIM_DEVKIT_ROOT:"*) ;;
+  "$_sd_pp:"*|"$_sd_pp") ;;
   *) export PYTHONPATH="$_sd_pp${PYTHONPATH:+:$PYTHONPATH}" ;;
 esac
 unset _sd_pp
