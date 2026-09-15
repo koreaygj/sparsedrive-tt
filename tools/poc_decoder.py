@@ -47,7 +47,7 @@ def main():
         exact = torch.equal(traj, ref)
         print(f"  [decoder] {dt:8.1f} ms")
         print(f"      trajectory {tuple(traj.shape)}  max|d| {err:.3e}"
-              f"  {'같은 후보 선택' if err < 1e-6 else '다른 후보 선택'}")
+              f"  {'same candidate' if err < 1e-6 else 'DIFFERENT candidate'}")
         print(f"      got  {traj[:3].tolist()}")
         print(f"      want {ref[:3].tolist()}")
         ok = err < 1e-6

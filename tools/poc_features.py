@@ -1,7 +1,8 @@
-"""model/features.py 가 navsim 빌더와 같은 값을 내는가.
+"""Does model/features.py produce the same values as the navsim builder?
 
-재구현이므로, 같지 않으면 쓸 이유가 없다. $NAVSIM_PY 로 기준을 만들고
-$TT_PY 로 비교한다 — 두 인터프리터가 같은 토큰에 대해.
+It is a reimplementation, so it is only worth having if it matches.
+$NAVSIM_PY writes the reference and $TT_PY compares against it -- two
+interpreters over the same tokens.
 """
 import argparse, gzip, os, pathlib, pickle, sys
 import torch
@@ -41,7 +42,7 @@ def main():
                             iwh=torch.as_tensor(c["image_wh"].copy()).float(),
                             status=r["status_feature"].float())
         torch.save(ref, out)
-        print(f"  기준 {len(ref)}개 토큰 저장")
+        print(f"  wrote the reference for {len(ref)} tokens")
         return 0
 
     ref = torch.load(out, map_location="cpu", weights_only=False)

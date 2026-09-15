@@ -57,7 +57,7 @@ def main():
         outs = net(ttnn.from_torch(xt.reshape(1, 1, B * H * W, 4), dtype=ttnn.bfloat16,
                                    layout=ttnn.ROW_MAJOR_LAYOUT, device=dev))
         ttnn.synchronize_device(dev); dt = (time.time() - t0) * 1e3
-        print(f"  [ResNet-34] {dt:7.1f} ms (웜업 후, {args.stages} stage)")
+        print(f"  [ResNet-34] {dt:7.1f} ms (warm, {args.stages} stage)")
 
         ok = True
         for i, (t, h, w, c) in enumerate(outs):

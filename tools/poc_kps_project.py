@@ -123,7 +123,7 @@ def main():
 
     print(f"  frame {frame.name}   anchors={n}  pts={NUM_PTS}  cams={C}")
     print(f"  fix_height {FIX_HEIGHT}  num_learnable_pts {NUM_LEARNABLE}")
-    print(f"  좌표 체인 dtype: {args.coord_dtype}")
+    print(f"  coordinate chain dtype: {args.coord_dtype}")
     print()
 
     dev = ttnn.open_device(device_id=0)
@@ -196,10 +196,10 @@ def main():
         inb_w = ((want[..., 0] > 0) & (want[..., 0] < 1)
                  & (want[..., 1] > 0) & (want[..., 1] < 1))
         flips = int((inb_g != inb_w).sum())
-        print(f"      sampling_location  (전체 PCC {pcc(got, want):.6f}"
-              f", max|d| {(got - want).abs().max():.2e} -- 클램프 폭발 포함, 무의미)")
-        print(f"      in-bounds 판정 일치율 {(inb_g == inb_w).float().mean():.6f}"
-              f"  (뒤집힘 {flips} / {inb_g.numel()}, 보이는 점의 "
+        print(f"      sampling_location  (PCC over all {pcc(got, want):.6f}"
+              f", max|d| {(got - want).abs().max():.2e} -- includes the clamp blow-up, so meaningless)")
+        print(f"      in-bounds agreement {(inb_g == inb_w).float().mean():.6f}"
+              f"  (flipped {flips} / {inb_g.numel()}, of the visible points "
               f"{flips / max(int(inb_w.sum()), 1) * 100:.2f}%)")
 
         keep = inb_w & inb_g
@@ -208,9 +208,9 @@ def main():
         py = float((gk[..., 1] - wk[..., 1]).abs().max())
         qx = float((gk[..., 0] - wk[..., 0]).abs().quantile(0.99))
         qy = float((gk[..., 1] - wk[..., 1]).abs().quantile(0.99))
-        print(f"      보이는 점만: PCC {pcc(gk, wk):.6f}")
-        print(f"        최대 오차  u {px*512:6.2f} px, v {py*256:6.2f} px")
-        print(f"        p99 오차   u {qx*512:6.2f} px, v {qy*256:6.2f} px")
+        print(f"      visible points only: PCC {pcc(gk, wk):.6f}")
+        print(f"        max error  u {px*512:6.2f} px, v {py*256:6.2f} px")
+        print(f"        p99 error  u {qx*512:6.2f} px, v {qy*256:6.2f} px")
 
         ok = pcc(kp, ref_kp[0, :n]) >= 0.999 and pcc(gk, wk) >= 0.999
         print("PASS" if ok else "FAIL")

@@ -199,9 +199,9 @@ def main():
 
         want = ref_out[0, :n]
         p = pcc(got, want)
-        print(f"  [DFA 전체] {dt:7.1f} ms (웜업 후, anchor {n})")
+        print(f"  [DFA full] {dt:7.1f} ms (warm, anchor {n})")
         print(f"      p_deform_model.out   PCC {p:.6f}   max|d| {(got - want).abs().max():.3e}")
-        print(f"      스케일  got {got.abs().mean():.4f}  vs  want {want.abs().mean():.4f}")
+        print(f"      scale   got {got.abs().mean():.4f}  vs  want {want.abs().mean():.4f}")
         ok = p >= 0.999
         print("PASS" if ok else "FAIL")
         return 0 if ok else 1

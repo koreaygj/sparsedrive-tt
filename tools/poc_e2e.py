@@ -30,8 +30,8 @@ def main():
         err = float((traj - ref).abs().max())
         print(f"  [end to end] {dt:8.1f} ms")
         print(f"      trajectory {tuple(traj.shape)}  max|d| {err:.3e}"
-              f"  {'같은 후보' if err < 1e-6 else '다른 후보'}")
-        print(f"      got  {[round(v,4) for v in traj[-1].tolist()]}  (마지막 pose)")
+              f"  {'same candidate' if err < 1e-6 else 'DIFFERENT candidate'}")
+        print(f"      got  {[round(v,4) for v in traj[-1].tolist()]}  (last pose)")
         print(f"      want {[round(v,4) for v in ref[-1].tolist()]}")
         ok = err < 1e-6
         print("PASS" if ok else "FAIL")

@@ -160,7 +160,7 @@ def main():
         print(f"  [softmax {sub_clp:>4d}] {t_sm:7.1f} ms   PCC {pcc(got, want):.6f}"
               f"   row-sum err {(got.reshape(-1, sub_clp, G).sum(1) - 1).abs().max():.3e}")
         print()
-        print(f"  총 {t_fc + t_sm:.1f} ms  (호스트에 남아있던 weights 준비를 대체)")
+        print(f"  total {t_fc + t_sm:.1f} ms  (replaces the weights preparation that was left on the host)")
     finally:
         ttnn.close_device(device)
     return 0

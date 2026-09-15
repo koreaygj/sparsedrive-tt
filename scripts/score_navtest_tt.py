@@ -41,7 +41,7 @@ def main():
     a = ap.parse_args()
 
     traj = torch.load(a.traj, map_location="cpu", weights_only=False)
-    print(f"  궤적 {len(traj)}개 로드")
+    print(f"  loaded {len(traj)} trajectories")
 
     with initialize_config_dir(config_dir=str(
             DEVKIT / "navsim/planning/script/config/pdm_scoring"), version_base=None):
@@ -54,7 +54,7 @@ def main():
 
     rows: List[Dict[str, Any]] = []
     toks = [t for t in traj if t in mcl.tokens]
-    print(f"  metric cache 와 교집합 {len(toks)}개")
+    print(f"  {len(toks)} tokens in common with the metric cache")
     for i, tok in enumerate(toks):
         mc = mcl.get_from_token(tok)
         t = Trajectory(traj[tok].numpy().astype(np.float32), sampling)
@@ -77,13 +77,13 @@ def main():
     df.to_csv(a.out, index=False)
     valid = int(df["valid"].sum()) if "valid" in df else len(df)
     if valid == 0:
-        print(f"\n  !! 유효 0건 / {len(df)}건 — 채점이 전부 실패했습니다")
+        print(f"\n  !! 0 valid of {len(df)} -- every score failed")
         if "err" in df:
-            print("     예외:", df["err"].value_counts().to_dict())
+            print("     exceptions:", df["err"].value_counts().to_dict())
         return 1
     num = df.select_dtypes("number")
     print()
-    print(f"  채점 {len(df)}개   유효 {int(df.get('valid', pd.Series([True]*len(df))).sum())}")
+    print(f"  scored {len(df)}   valid {int(df.get('valid', pd.Series([True]*len(df))).sum())}")
     for c in num.columns:
         if c not in ("Unnamed: 0",):
             print(f"    {c:34s} {num[c].mean():.4f}")

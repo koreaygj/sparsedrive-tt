@@ -46,7 +46,7 @@ def main():
         ttnn.synchronize_device(dev); t0 = time.time()
         outs = run()
         ttnn.synchronize_device(dev); dt = (time.time() - t0) * 1e3
-        print(f"  [ResNet-34 + FPN] {dt:7.1f} ms (웜업 후)")
+        print(f"  [ResNet-34 + FPN] {dt:7.1f} ms (warm)")
         ok = True
         for i, (t, h, w, c) in enumerate(outs):
             got = ttnn.to_torch(t).float().reshape(B, h, w, c).permute(0, 3, 1, 2)

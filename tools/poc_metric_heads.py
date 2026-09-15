@@ -58,9 +58,9 @@ def combine(lg):
 def main():
     frames = sorted((EXP / "golden").glob("*.pt"))
     sd = torch.load(CKPT, map_location="cpu", weights_only=False)["state_dict"]
-    print(f"  프레임 {len(frames)}개   metric head {len(V1)}개 (v1)")
+    print(f"  {len(frames)} frames   {len(V1)} metric heads (v1)")
     print(f"  {'frame':<18} {'worst PCC':>10} {'score PCC':>10} "
-          f"{'argmax':>14} {'1-2위 차':>11} {'/범위':>9}")
+          f"{'argmax':>14} {'top-2 gap':>11} {'/range':>9}")
 
     dev = ttnn.open_device(device_id=0, l1_small_size=24576)
     try:
@@ -96,15 +96,15 @@ def main():
                   f" {gap:11.3e} {gap/rng:9.2e}")
         mt = torch.tensor(margins)
         print()
-        print(f"  argmax 일치 {agree}/{len(frames)}")
-        print(f"  1-2위 상대 차: 중앙값 {mt.median():.2e}  최소 {mt.min():.2e}  "
-              f"최대 {mt.max():.2e}")
+        print(f"  argmax agreement {agree}/{len(frames)}")
+        print(f"  top-2 relative gap: median {mt.median():.2e}  min {mt.min():.2e}  "
+              f"max {mt.max():.2e}")
         # The heads themselves are the thing being graded, and they pass. The
         # argmax rate is reported, not asserted: a flip between candidates that
         # score within 2e-06 of each other is a property of the model, not a
         # defect in the port, and whether it costs anything is a PDMS question.
         ok = True
-        print("PASS (heads)  —  argmax 일치율은 위 참조")
+        print("PASS (heads)  --  see the argmax agreement above")
         return 0 if ok else 1
     finally:
         ttnn.close_device(dev)

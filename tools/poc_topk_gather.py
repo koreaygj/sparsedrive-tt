@@ -94,9 +94,9 @@ def main():
         same_ord = torch.equal(got_idx, ref_idx)
         overlap = len(set(got_idx.tolist()) & set(ref_idx.tolist()))
         srt = torch.sort(scores, descending=True).values
-        print(f"  [topk+gather] {dt:6.2f} ms (웜업 후)")
-        print(f"      집합 일치 {same_set}   순서 일치 {same_ord}   겹침 {overlap}/{K}")
-        print(f"      경계 간격 s[{K-1}]-s[{K}] = {(srt[K-1]-srt[K]):.3e}")
+        print(f"  [topk+gather] {dt:6.2f} ms (warm)")
+        print(f"      set match {same_set}   order match {same_ord}   overlap {overlap}/{K}")
+        print(f"      boundary gap s[{K-1}]-s[{K}] = {(srt[K-1]-srt[K]):.3e}")
 
         got_e = ttnn.to_torch(oe).float()[:K]
         got_v = ttnn.to_torch(ov).float()[:K]
@@ -106,7 +106,7 @@ def main():
             pos = {v: i for i, v in enumerate(got_idx.tolist())}
             perm = torch.tensor([pos[v] for v in ref_idx.tolist()])
             got_e, got_v = got_e[perm], got_v[perm]
-            note = "  (순서 정렬 후)"
+            note = "  (after sorting by order)"
         else:
             note = ""
         pe, pv = pcc(got_e, ref_embed), pcc(got_v, ref_vocab)

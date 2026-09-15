@@ -73,7 +73,7 @@ def main():
     ok = True
     try:
         cfg = ttnn.WormholeComputeKernelConfig(**HIFI)
-        print("  --- LayerNorm (residual 포함, 모듈 경계로 재구성) ---")
+        print("  --- LayerNorm (with the residual, rebuilt at the module boundary) ---")
         for name, ra, rb, out in NORMS:
             a, b, ref = d[G + ra][0], d[G + rb][0], d[G + out][0]
             w = _t(sd[P + name + ".weight"].float(), dev)
@@ -84,7 +84,7 @@ def main():
             print(f"      {name.replace('decoder.layers.',''):16s} T={a.shape[0]:4d}"
                   f"  PCC {p:.6f}  max|d| {(got-ref).abs().max():.2e}")
 
-        print("  --- MLP / 임베딩 ---")
+        print("  --- MLP / embeddings ---")
         for name, xi, out in MLPS:
             x, ref = d[G + xi][0], d[G + out][0]
             mlp = TtFFN(sd, P + name + ".", dev)

@@ -83,26 +83,26 @@ def main():
 
     same = (m_true == m_bounds).float().mean()
     print(f"  frame {frame.name}   anchors={n}  C={C} L={L} P={P} G={G}")
-    print(f"  보이는 비율: {m_true.float().mean():.4f}")
-    print(f"  bounds-only 근사 일치율: {same:.6f}"
-          f"  (불일치 {int((m_true != m_bounds).sum())} / {m_true.numel()})")
+    print(f"  visible fraction: {m_true.float().mean():.4f}")
+    print(f"  bounds-only approximation agreement: {same:.6f}"
+          f"  (mismatched {int((m_true != m_bounds).sum())} / {m_true.numel()})")
     print()
 
-    # -inf 대상: 이 카메라는 못 보지만 다른 카메라는 보는 점
+    # silenced: this camera cannot see the point but another one can
     mp = m_true.permute(0, 2, 1, 3)[..., None, :, None]  # (1, n, C, 1, P, 1)
     silence = torch.logical_and(~mp, mp.sum(dim=2, keepdim=True) != 0)
     keep01 = (~silence).float().expand(1, n, C, L, P, G).reshape(n, wide).contiguous()
-    print(f"  침묵 처리되는 항목 비율: {silence.float().mean():.4f}")
+    print(f"  silenced fraction: {silence.float().mean():.4f}")
 
-    # 호스트 레퍼런스: 실제 코드 그대로 -inf + softmax
+    # host reference: -inf + softmax, exactly as the model does it
     lg = logits[0, :n].reshape(n, C, 1, 1, 1) if False else \
         logits[0, :n].reshape(n, C, L, P, G)
     ref = lg.masked_fill(silence[0], float("-inf")).reshape(n, -1, G).softmax(dim=1)
     ref = ref.reshape(n, C, L, P, G)
 
-    # 골든과 대조: [n*P, C, L, G] -> [n, C, L, P, G]
+    # against the golden: [n*P, C, L, G] -> [n, C, L, P, G]
     gw = gold_w[0, :n * P].reshape(n, P, C, L, G).permute(0, 2, 3, 1, 4)
-    print(f"  호스트 레퍼런스 vs 골든 DAF[0].weights   PCC {pcc(ref, gw):.6f}"
+    print(f"  host reference vs golden DAF[0].weights   PCC {pcc(ref, gw):.6f}"
           f"   max|d| {(ref - gw).abs().max():.3e}")
     print()
 
@@ -159,16 +159,16 @@ def main():
             ttnn.deallocate(em); ttnn.deallocate(sb)
             return w
 
-        run()                                            # JIT 워밍업
+        run()                                            # JIT warm-up
         ttnn.synchronize_device(device); t0 = time.time()
         w_tt = run()
         ttnn.synchronize_device(device); dt = (time.time() - t0) * 1e3
         got = ttnn.to_torch(w_tt).float().reshape(n, C, L, P, G)
 
-        print(f"  [장치 mask+softmax] {dt:7.1f} ms (웜업 후)")
-        print(f"      vs 골든 DAF[0].weights      PCC {pcc(got, gw):.6f}"
+        print(f"  [device mask+softmax] {dt:7.1f} ms (warm)")
+        print(f"      vs golden DAF[0].weights      PCC {pcc(got, gw):.6f}"
               f"   max|d| {(got - gw).abs().max():.3e}")
-        print(f"      행 합 오차                  "
+        print(f"      row-sum error               "
               f"{(got.reshape(n, -1, G).sum(1) - 1).abs().max():.3e}")
         ok = pcc(got, gw) >= 0.999
         print("PASS" if ok else "FAIL")
