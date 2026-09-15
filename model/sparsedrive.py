@@ -96,5 +96,7 @@ class TtSparseDrive:
         n_vel = self.vel_vocab.shape[0]
         ve = to_host(self.vel_pos(
             _t(self.vel_vocab, self.dev)), self.dev).float()[:n_vel]
+        # proj[:, :3] goes up once for all three DFA instances.
+        proj_tt = _t(proj[:, :3].reshape(self.C, -1), self.dev)
         return self.decoder(pe, ve, self.path_vocab, self.traj_vocab, status,
-                            levels, img_tt, n_img, proj, iwh)
+                            levels, img_tt, n_img, proj, proj_tt, iwh)

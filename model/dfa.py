@@ -292,8 +292,12 @@ class TtDFA:
             self._consts_key = key
         return self._consts
 
-    def _camera_embed(self, proj):
-        ce = self.T(proj[:, :3].reshape(self.C, -1))
+    def _camera_embed(self, proj_tt):
+        """`proj_tt` is proj[:, :3] flattened, uploaded ONCE per frame by the
+        caller. All three DFA instances want the same 12 numbers a camera, and
+        uploading them separately cost 3.7 ms a frame for 36 floats -- the
+        charge is per from_torch call, not per byte."""
+        ce = proj_tt
         h = ttnn.layer_norm(ttnn.relu(ttnn.linear(ce, self.ce_w[0], bias=self.ce_b[0],
                                                   compute_kernel_config=self.hi)),
                             weight=self.ln_w[0], bias=self.ln_b[0])
@@ -500,7 +504,8 @@ class TtDFA:
         ttnn.deallocate(w)
         return per
 
-    def __call__(self, feat, anchor, levels_tt, proj, iwh, chunk=1024, splits=None):
+    def __call__(self, feat, anchor, levels_tt, proj, proj_tt, iwh,
+                 chunk=1024, splits=None):
         """feat [n, E] torch, anchor [n, num_sample*2] torch. -> [n, E] torch.
 
         Big blocks. Measured on DAF[0], PCC identical to six decimals at every
@@ -530,7 +535,7 @@ class TtDFA:
                (self.P * ((n % chunk or chunk) // self.nd)) % GP_K == 0, (
             f"P={self.P}: a device's plane P*(chunk/nd) must divide into "
             f"{GP_K}-point grid rows")
-        cam = self._camera_embed(proj)
+        cam = self._camera_embed(proj_tt)
         consts = self._gp_pack(levels_tt)
         outs = []
         for a0 in range(0, n, chunk):

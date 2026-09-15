@@ -57,14 +57,14 @@ class TtDecoderLayer:
             self.heads = {m: TtFFN(sd, prefix + f"metric_heads.{m}.", device)
                           for m in V1_METRICS}
 
-    def _branch(self, x, dfa, anchor, levels, proj, iwh, attn, ffn, mlp, n1, n2,
+    def _branch(self, x, dfa, anchor, levels, proj, proj_tt, iwh, attn, ffn, mlp, n1, n2,
                 pre_attn=None, img=None, ti=None):
         """DFA -> (optional cross-attn) -> self-attn -> norm -> FFN -> norm -> score."""
         T = x.shape[0]
         # The DFA hands back a device tensor, already gathered to every chip.
         # Only the branch without one (velocity) still starts from the host.
         if dfa is not None:
-            xt = dfa(x, anchor, levels, proj, iwh)
+            xt = dfa(x, anchor, levels, proj, proj_tt, iwh)
         else:
             xt = _t(x, self.dev)
         if pre_attn is not None:      # velocity branch attends to image tokens first
@@ -77,26 +77,26 @@ class TtDecoderLayer:
         return to_host(xt, self.dev).float()[:T], scores
 
     def __call__(self, path_embed, vel_embed, path_anchor, status, levels,
-                 img_tt, n_img, proj, iwh, k_path, k_vel):
+                 img_tt, n_img, proj, proj_tt, iwh, k_path, k_vel):
         path_embed = path_embed + status
         vel_embed = vel_embed + status
         p_out, p_scores = self._branch(
-            path_embed, self.p_dfa, path_anchor, levels, proj, iwh,
+            path_embed, self.p_dfa, path_anchor, levels, proj, proj_tt, iwh,
             self.p_attn, self.p_ffn, self.p_mlp, "p_norm1", "p_norm2")
         v_out, v_scores = self._branch(
-            vel_embed, None, None, levels, proj, iwh,
+            vel_embed, None, None, levels, proj, proj_tt, iwh,
             self.v_attn, self.v_ffn, self.v_mlp, "v_norm1", "v_norm2",
             pre_attn=self.v_img, img=img_tt, ti=n_img)
         pi = torch.topk(p_scores, k_path).indices
         vi = torch.topk(v_scores, k_vel).indices
         return p_out[pi], v_out[vi], pi, vi
 
-    def trajectory(self, p_emb, v_emb, traj_anchor, levels, proj, iwh):
+    def trajectory(self, p_emb, v_emb, traj_anchor, levels, proj, proj_tt, iwh):
         """Last layer only: 20 paths x 20 velocities -> 400 candidates."""
         n_p, n_v = p_emb.shape[0], v_emb.shape[0]
         traj = (p_emb.unsqueeze(1) + v_emb.unsqueeze(0)).reshape(n_p * n_v, -1)
         T = traj.shape[0]
-        xt = self.t_dfa(traj, traj_anchor, levels, proj, iwh)
+        xt = self.t_dfa(traj, traj_anchor, levels, proj, proj_tt, iwh)
         xt = ttnn.add(xt, self.t_attn(xt, tq=T))
         xt = _ln(xt, *self.norms["t_norm1"])
         xt = ttnn.add(xt, self.t_ffn(xt))
@@ -118,7 +118,7 @@ class TtDecoder:
                        for i in range(2)]
 
     def __call__(self, path_embed, vel_embed, path_vocab, traj_vocab, status,
-                 levels, img_tt, n_img, proj, iwh):
+                 levels, img_tt, n_img, proj, proj_tt, iwh):
         """Returns the selected trajectory [num_poses, 3].
 
         img_tt is the last FPN level flattened to image tokens, already on
@@ -131,7 +131,7 @@ class TtDecoder:
             anchor = path_vocab[p_abs][..., :2].reshape(len(p_abs), -1)
             path_embed, vel_embed, pi, vi = layer(
                 path_embed, vel_embed, anchor, status, levels, img_tt, n_img,
-                proj, iwh, self.pf[i], self.vf[i])
+                proj, proj_tt, iwh, self.pf[i], self.vf[i])
             # compose rather than gather: layer i selects within layer i-1's
             # survivors, so indices into the original vocabulary chain.
             p_abs, v_abs = p_abs[pi], v_abs[vi]
@@ -139,5 +139,5 @@ class TtDecoder:
         last = self.layers[-1]
         tv = traj_vocab[p_abs][:, v_abs]                    # [20, 20, poses, 3]
         anchor = tv[..., :2].reshape(-1, tv.shape[2] * 2)   # [400, poses*2]
-        scores = last.trajectory(path_embed, vel_embed, anchor, levels, proj, iwh)
+        scores = last.trajectory(path_embed, vel_embed, anchor, levels, proj, proj_tt, iwh)
         return tv.reshape(-1, tv.shape[2], tv.shape[3])[int(scores.argmax())]

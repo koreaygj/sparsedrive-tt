@@ -57,9 +57,10 @@ def main():
             # timing at 128 measures a fresh JIT compile, which is how the traj
             # call first read 5613 ms for a sixteenth of layer 0's work.
             CH = 128
-            dfa(feat, anchor, levels, proj, iwh, chunk=CH)
+            proj_tt = dfa.T(proj[:, :3].reshape(dfa.C, -1))
+            dfa(feat, anchor, levels, proj, proj_tt, iwh, chunk=CH)
             ttnn.synchronize_device(dev); t0 = time.time()
-            got_tt = dfa(feat, anchor, levels, proj, iwh, chunk=CH)
+            got_tt = dfa(feat, anchor, levels, proj, proj_tt, iwh, chunk=CH)
             ttnn.synchronize_device(dev); dt = (time.time() - t0) * 1e3
             # the DFA returns a device tensor now, gathered to every chip
             got = dfa.G2T(got_tt).float()[:n]
