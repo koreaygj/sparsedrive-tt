@@ -28,12 +28,25 @@ V1_METRICS = ["no_at_fault_collisions", "drivable_area_compliance",
 ALL_METRICS = V1_METRICS + ["driving_direction_compliance"]
 
 
-def _idx(dev, i, k):
-    """[k] host indices -> [1, 1, 1, k] uint32 ROW_MAJOR, replicated."""
-    from .mesh import mesh_of
-    return ttnn.from_torch(i.to(torch.int32).reshape(1, 1, 1, k).contiguous(),
-                           layout=ttnn.ROW_MAJOR_LAYOUT, device=dev,
-                           dtype=ttnn.uint32, mesh_mapper=mesh_of(dev)[1])
+def _topk(dev, row, k):
+    """[1, 1, 1, T] scores -> [1, 1, 1, k] uint32 ROW_MAJOR source positions.
+
+    ttnn.topk_select resolves ties to the lower index. torch.topk does NOT --
+    measured, 64 equal values gave torch [44, 41, 42, ...] against this op's
+    [0, 1, 2, ...] -- so on a tie at the k-th boundary the two can keep
+    different rows. Both are valid top-k sets and this one is the reproducible
+    one; what it is not is the arbitrary choice the reference PDMS was computed
+    with.
+    """
+    val = ttnn.allocate_tensor_on_device(
+        ttnn.TensorSpec(ttnn.Shape([1, 1, 1, k]), ttnn.bfloat16,
+                        ttnn.ROW_MAJOR_LAYOUT, ttnn.BufferType.DRAM), dev)
+    idx = ttnn.allocate_tensor_on_device(
+        ttnn.TensorSpec(ttnn.Shape([1, 1, 1, k]), ttnn.uint32,
+                        ttnn.ROW_MAJOR_LAYOUT, ttnn.BufferType.DRAM), dev)
+    ttnn.topk_select(row, val, idx, k)
+    ttnn.deallocate(val)
+    return idx
 
 
 def _like(dev, src, k):
@@ -45,13 +58,14 @@ def _like(dev, src, k):
                         ttnn.TILE_LAYOUT, ttnn.BufferType.DRAM), dev)
 
 
-def _gather2(dev, a, b, i, k):
-    """out_a[r] = a[i[r]], and the same for b when given. Bit-identical rows."""
-    it = _idx(dev, i, k)
+def _gather2(dev, a, b, it, k):
+    """out_a[r] = a[it[r]], and the same for b when given. Bit-identical rows.
+
+    `it` is topk_select's uint32 ROW_MAJOR output, consumed directly.
+    """
     oa = _like(dev, a, k)
     ob = _like(dev, b, k) if b is not None else None
     ttnn.row_gather(a, it, oa, b, ob, k)
-    ttnn.deallocate(it)
     return oa, ob
 
 
@@ -101,8 +115,12 @@ class TtDecoderLayer:
         xt = _ln(xt, *self.norms[n1])
         xt = ttnn.add(xt, ffn(xt))
         xt = _ln(xt, *self.norms[n2])
-        scores = to_host(mlp(xt), self.dev).float()[:T, 0]
-        return xt, scores
+        # The scores stay on device: ttnn.topk_select reads them as one
+        # logical row, so [T, 1] is transposed rather than downloaded.
+        sc = mlp(xt)
+        row = ttnn.reshape(ttnn.transpose(sc, 0, 1), (1, 1, 1, T))
+        ttnn.deallocate(sc)
+        return xt, row
 
     def __call__(self, path_embed, vel_embed, path_anchor, status, levels,
                  img_tt, n_img, proj, proj_tt, iwh, k_path, k_vel):
@@ -115,15 +133,23 @@ class TtDecoderLayer:
             vel_embed, None, None, levels, proj, proj_tt, iwh,
             self.v_attn, self.v_ffn, self.v_mlp, "v_norm1", "v_norm2",
             pre_attn=self.v_img, img=img_tt, ti=n_img)
-        pi = torch.topk(p_scores, k_path).indices
-        vi = torch.topk(v_scores, k_vel).indices
-        # The survivors are selected on device. The path branch gathers its
-        # anchor alongside its embedding -- one row_gather carries both pairs --
-        # which is also what removes the anchor's own upload: layer i+1's
-        # anchor is layer i's gathered by the same indices, never re-derived
-        # from the vocabulary on the host.
-        p_sel, a_sel = _gather2(self.dev, p_out, path_anchor, pi, k_path)
-        v_sel, _ = _gather2(self.dev, v_out, None, vi, k_vel)
+        # top-k on device. Its uint32 ROW_MAJOR indices are exactly what
+        # row_gather consumes, so the selection never touches the host: the
+        # scores (4 KB at T=1024) do not come down, and the indices do not go
+        # back up. The path branch gathers its anchor alongside its embedding
+        # -- one row_gather carries both pairs -- which is what removes the
+        # anchor's upload too: layer i+1's anchor is layer i's gathered by the
+        # same indices, never re-derived from the vocabulary on the host.
+        pi_tt = _topk(self.dev, p_scores, k_path)
+        vi_tt = _topk(self.dev, v_scores, k_vel)
+        p_sel, a_sel = _gather2(self.dev, p_out, path_anchor, pi_tt, k_path)
+        v_sel, _ = _gather2(self.dev, v_out, None, vi_tt, k_vel)
+        # The indices DO come back, 80 bytes of them, because the final answer
+        # is a row of traj_vocab and picking it is a host index either way.
+        pi = to_host(pi_tt, self.dev).reshape(-1)[:k_path].long()
+        vi = to_host(vi_tt, self.dev).reshape(-1)[:k_vel].long()
+        for t in (p_scores, v_scores, pi_tt, vi_tt):
+            ttnn.deallocate(t)
         return p_sel, v_sel, a_sel, pi, vi
 
     def trajectory(self, p_emb, v_emb, traj_anchor, levels, proj, proj_tt, iwh):
@@ -152,7 +178,18 @@ class TtDecoderLayer:
         # carries about 4e-3, so the sigmoids and the weighted sum have to be
         # done wider than the device does them by default. Five downloads of
         # 2 KB is what that costs.
-        lg = {m: to_host(h(xt), self.dev).float()[:T, 0] for m, h in self.heads.items()}
+        # The five logits ride down as one [T, 5] tensor -- five separate
+        # downloads of a [T, 1] column cost five call overheads for 2 KB each.
+        # The sigmoids and the weighted sum stay on the HOST, in fp32.
+        # Composing them on device was tried and moved the trajectory by 2.3,
+        # a different candidate: the top two sit 1.7e-06 apart in relative
+        # terms and bf16 carries about 4e-3.
+        cols = [self.heads[m](xt) for m in V1_METRICS]
+        packed = ttnn.concat(cols, dim=-1)
+        h5 = to_host(packed, self.dev).float()[:T]
+        for t in cols + [packed]:
+            ttnn.deallocate(t)
+        lg = {m: h5[:, i] for i, m in enumerate(V1_METRICS)}
         scores = (torch.sigmoid(lg["no_at_fault_collisions"])
                   * torch.sigmoid(lg["drivable_area_compliance"])) * (
             5 * torch.sigmoid(lg["time_to_collision_within_bound"])
