@@ -11,6 +11,7 @@ same slice takes the first copy.
 """
 
 import os
+import pathlib
 
 import ttnn
 
@@ -25,14 +26,24 @@ def enable_fabric():
     fail -- it hangs the device until tt-smi -r. Call this BEFORE opening the
     mesh device; setting it afterwards does not reach an open device.
 
-    Refuses unless TT_MESH_GRAPH_DESC_PATH names a mesh graph descriptor,
-    because the fabric is worse than useless without one. See the message.
+    Points TT_MESH_GRAPH_DESC_PATH at the stock n300 descriptor under
+    TT_METAL_HOME when it is not already set, and refuses if neither is
+    available -- the fabric is worse than useless without one. See the message.
+
+    Set it in the SHELL if ttnn has already built its runtime options by the
+    time this runs; the check below says which happened.
 
     Measured no cost: the compute grid stays 8x8 on both chips and a frame runs
     the same. What it buys is the anchor gather at the DFA's output, 3.25 ms of
     host round trip at 1024 anchors against 0.17 on device.
     """
     global _FABRIC
+    if not os.environ.get("TT_MESH_GRAPH_DESC_PATH"):
+        stock = (pathlib.Path(os.environ.get("TT_METAL_HOME", "")) / "tt_metal" /
+                 "fabric" / "mesh_graph_descriptors" /
+                 "n300_mesh_graph_descriptor.textproto")
+        if stock.is_file():
+            os.environ["TT_MESH_GRAPH_DESC_PATH"] = str(stock)
     if not os.environ.get("TT_MESH_GRAPH_DESC_PATH"):
         raise RuntimeError(
             "TT_MESH_GRAPH_DESC_PATH is not set. Enabling the fabric without it "
