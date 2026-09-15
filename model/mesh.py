@@ -10,6 +10,8 @@ both copies stacked. Callers already slice `[:T]` for tile padding, and that
 same slice takes the first copy.
 """
 
+import os
+
 import ttnn
 
 
@@ -23,11 +25,26 @@ def enable_fabric():
     fail -- it hangs the device until tt-smi -r. Call this BEFORE opening the
     mesh device; setting it afterwards does not reach an open device.
 
+    Refuses unless TT_MESH_GRAPH_DESC_PATH names a mesh graph descriptor,
+    because the fabric is worse than useless without one. See the message.
+
     Measured no cost: the compute grid stays 8x8 on both chips and a frame runs
     the same. What it buys is the anchor gather at the DFA's output, 3.25 ms of
     host round trip at 1024 anchors against 0.17 on device.
     """
     global _FABRIC
+    if not os.environ.get("TT_MESH_GRAPH_DESC_PATH"):
+        raise RuntimeError(
+            "TT_MESH_GRAPH_DESC_PATH is not set. Enabling the fabric without it "
+            "kills the device: tt-metal only loads the stock mesh graph "
+            "descriptor when there is more than one host rank, so a single "
+            "process falls back to auto-discovery, auto-discovery does not know "
+            "this motherboard, and the E/W routing planes never get registered. "
+            "all_gather then logs 'Failed to discover available ethernet links' "
+            "and the ethernet cores' mailboxes go bad a few hundred frames "
+            "later. Point it at "
+            "$TT_METAL_HOME/tt_metal/fabric/mesh_graph_descriptors/"
+            "n300_mesh_graph_descriptor.textproto")
     if hasattr(ttnn, "set_fabric_config"):
         ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
         _FABRIC = True
