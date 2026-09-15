@@ -44,25 +44,16 @@ class TtSparseDrive:
         self.vel_vocab = sd[T + "vel_vocab"].float()
         self.traj_vocab = sd[T + "traj_vocab"].float()
         self.decoder = TtDecoder(sd, T + "decoder.", device)
-        # Checkpoint constants: the vocabularies and the path anchor never
-        # change, so they go up once here instead of every frame.
         n_path, n_vel = self.path_vocab.shape[0], self.vel_vocab.shape[0]
         self.pv_tt = _t(self.path_vocab.reshape(n_path, -1), device)
         self.vv_tt = _t(self.vel_vocab, device)
         self.anchor_tt = _t(self.path_vocab[..., :2].reshape(n_path, -1), device,
                             dtype=ttnn.float32)
-        # traj_vocab, flattened so one row_gather can reach any (path, vel)
-        # pair: row p*n_vel + v. fp32 for both, because one of them IS the
-        # answer -- the trajectory the model returns -- and the other is
-        # geometry. 40 MB a chip, once, against 20 KB a frame of host traffic.
-        tv = self.traj_vocab                            # [n_path, n_vel, poses, 3]
+        tv = self.traj_vocab
         self.poses = tv.shape[2]
         self.tv_all = _t(tv.reshape(n_path * n_vel, -1), device, dtype=ttnn.float32)
         self.tv_xy = _t(tv[..., :2].reshape(n_path * n_vel, -1), device,
                         dtype=ttnn.float32)
-        # The absolute vocabulary index rides along as a [T, 1] column, gathered
-        # by the same top-k indices as everything else, so the host never has to
-        # compose it.
         self.p_abs0 = _t(torch.arange(n_path).float().reshape(-1, 1), device,
                          dtype=ttnn.float32)
         self.v_abs0 = _t(torch.arange(n_vel).float().reshape(-1, 1), device,
@@ -72,10 +63,6 @@ class TtSparseDrive:
     def features(self, imgs):
         """imgs [cams, 3, H, W] -> per-level ttnn NHWC + the image tokens."""
         x = torch.nn.functional.pad(imgs.permute(0, 2, 3, 1), (0, 1))
-        # Upload wide, reshape on device. The backbone wants [1, 1, N, 4], and
-        # from_torch costs per ROW: 393,216 rows of 8 bytes measured 30.5 ms
-        # for 3 MB, where the same bytes as 6,144 rows of 256 take 2.6. Same
-        # trick the sampling grid needed, same reason, and bit-identical.
         n4 = self.C * self.H * self.W
         xt = ttnn.reshape(
             ttnn.from_torch(x.reshape(1, 1, n4 * 4 // 256, 256).bfloat16().contiguous(),
@@ -85,40 +72,22 @@ class TtSparseDrive:
         outs = self.fpn(self.backbone(xt))
         levels, last = [], None
         for (t, h, w, c) in outs:
-            # The conv output is [1, 1, N, C] and the DFA wants [cams, h, w, C].
-            # This used to go through the host -- 31.9 MB down and 15.9 MB back
-            # up, 23.7 ms -- and the reason was the mesh: to_host composes the
-            # replicas onto dim 0, so the caller flattened and took one copy's
-            # worth. But the tensor is REPLICATED, so every device already holds
-            # the whole thing and there is nothing to compose: N is exactly
-            # cams*h*w on all four levels, with no padding at all, and the
-            # reshape is a reshape.
-            #
-            # ROW_MAJOR first, then reshape: [cams, h, w, C] puts h*w in the
-            # second-to-last position and the coarsest level's is 16, which a
-            # TILE tensor would pad to 32.
             v = t
             if v.memory_config().memory_layout != ttnn.TensorMemoryLayout.INTERLEAVED:
                 v = ttnn.sharded_to_interleaved(v, ttnn.DRAM_MEMORY_CONFIG)
             levels.append(ttnn.reshape(
                 ttnn.to_layout(v, ttnn.ROW_MAJOR_LAYOUT), (self.C, h, w, c)))
             last = (v, h, w, c)
-        # image tokens for the velocity branch's cross-attention: the coarsest
-        # level, cams x h x w flattened. It stays TILE -- attention matmuls it.
         v, h, w, c = last
         return levels, ttnn.reshape(v, (self.C * h * w, c)), self.C * h * w
 
     def __call__(self, imgs, status_feature, proj, iwh):
         levels, img_tt, n_img = self.features(imgs)
-        # The status encoding and the two positional embeddings stay on device;
-        # they used to come down only to be added on the host and sent back.
-        # [1, E] broadcasts over [T, E].
         status = ttnn.linear(_t(status_feature.reshape(1, -1), self.dev),
                              self.w_st, bias=self.b_st,
                              compute_kernel_config=self.cfg)
         pe = self.path_pos(self.pv_tt)
         ve = self.vel_pos(self.vv_tt)
-        # proj[:, :3] goes up once for all three DFA instances.
         proj_tt = _t(proj[:, :3].reshape(self.C, -1), self.dev)
         return self.decoder(pe, ve, self.anchor_tt, status, levels, img_tt, n_img,
                             proj, proj_tt, iwh,

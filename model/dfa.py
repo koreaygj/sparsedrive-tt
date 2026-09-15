@@ -58,46 +58,9 @@ def _cast(x, dt):
     return x
 
 
-# grid_precompute's coords tile is 32 columns wide and the reader fills 2*K of
-# them, so a row carries at most 16 points. That is a tile shape, not a model
-# quantity -- a "row" here is just 16 consecutive grid points and may straddle
-# anchors, which nothing downstream can see because grid_sample's K-batched
-# output flattens back to point order.
 GP_K = 16
-Q14_SHIFT = 14                     # must match grid_precompute and grid_sample
+Q14_SHIFT = 14
 
-# How many partial sums grouped_weighted_sum splits the clp reduction into. It
-# sets two things at once:
-#
-#   parallelism -- work units are ceil(anchors/32) * num_chunks, and this DFA
-#     reduces 6000 clp into 512 anchors a chip, so 16 tile rows. The op's old
-#     fixed 2 gave 32 work units on a 64-core device: half of it idle, which is
-#     why the reduction measured 33 GiB/s against a 288 GiB/s part.
-#   accuracy -- each partial accumulates in bf16 through the packer, so the
-#     drift grows with its depth. This is what the `splits` slicing used to buy.
-#
-# The op alone, layer 0's reduction on the mesh, against an fp64 replay:
-#
-#   num_chunks   work units   clp/partial   gws      PCC vs fp64
-#            2           32          3000   41.7 ms    0.998712
-#            4           64          1500   21.0 ms    0.999262
-#            8          128           750   20.9 ms    0.999605
-#           16          256           375   21.0 ms    0.999858
-#
-# 2 -> 4 is the idle half of the device being filled; past that it is flat,
-# because the work units are exact multiples of the 64 cores. So the depth is
-# free, and the whole DFA against the PyTorch reference says take it:
-#
-#   num_chunks   DAF[0]     DAF[1]     DAF[2]
-#            8   0.999671   0.998983   0.999986
-#           16   0.999883   0.999704   0.999987
-#           30   0.999958   0.999905   0.999988      <- 152 / 27 / 16 ms
-#           40   0.999972   0.999932   0.999988
-#
-# 30 over 40 because DAF[1] has only 4 tile rows, so 40 is 160 work units on
-# 64 cores -- 2.5 rounds -- and it measured slower there. 30 beats what the
-# old splits=10 x num_chunks=2 managed (0.999919 / 0.999817 / 0.999987) on
-# every call, and 6000 and 960 are both divisible by it.
 GWS_CHUNKS = 30
 
 FIX_HEIGHT = (0.0, -0.25, -0.5, 0.25, 0.5)
@@ -126,7 +89,7 @@ def _q14_bits(t):
     """
     g = ttnn.clamp(ttnn.subtract(ttnn.multiply(t, 2.0), 1.0), -2.0, 2.0)
     q = ttnn.clamp(ttnn.round(ttnn.multiply(g, float(1 << Q14_SHIFT))), -32768.0, 32767.0)
-    r = ttnn.where(ttnn.ltz(q), ttnn.add(q, 65536.0), q)      # two's complement bits
+    r = ttnn.where(ttnn.ltz(q), ttnn.add(q, 65536.0), q)
     ttnn.deallocate(g); ttnn.deallocate(q)
     return r
 
@@ -169,7 +132,7 @@ def _gp_consts(shapes, K=GP_K, shift=Q14_SHIFT):
     for l, (H, W) in enumerate(shapes):
         for c in range(32):
             S = W if c < K else H
-            T[l, :, c] = (S / 2) * inv             # align_corners=False: g*S/2 + (S-1)/2
+            T[l, :, c] = (S / 2) * inv
             T[NL + l, :, c] = (S - 1) / 2
             T[2 * NL + l, :, c] = S - 1
     for j in range(OT):
@@ -179,11 +142,11 @@ def _gp_consts(shapes, K=GP_K, shift=Q14_SHIFT):
             if og >= 6 * K:
                 break
             f, k = og // K, og % K
-            if f == 0:                             # h0 <- floor of the y column
+            if f == 0:
                 SI[K + k, o] = 1.0
-            elif f == 1:                           # w0 <- floor of the x column
+            elif f == 1:
                 SI[k, o] = 1.0
-            else:                                  # nw ne sw se
+            else:
                 (SB0 if f in (2, 4) else SB1)[k, o] = 1.0
                 (SH0 if f in (2, 3) else SH1)[K + k, o] = 1.0
     return T.reshape(-1, 32).contiguous()
@@ -223,7 +186,6 @@ class TtDFA:
             _cast(x, dt).contiguous(), layout=ttnn.TILE_LAYOUT, device=device,
             dtype=dt, mesh_mapper=self.rep)
         self.T, self.f32 = T, ttnn.float32
-        # anchor-sharded uploads, and the composer that puts them back together
         self.S = lambda x, dt=ttnn.bfloat16, d=0: ttnn.from_torch(
             _cast(x, dt).contiguous(), layout=ttnn.TILE_LAYOUT, device=device, dtype=dt,
             mesh_mapper=(self.sh0 if d == 0 else self.sh1) if self.nd > 1 else None)
@@ -231,9 +193,6 @@ class TtDFA:
 
         self.Wl = T(g("kps_generator.learnable_fc.weight").t(), ttnn.float32)
         self.Bl = T(g("kps_generator.learnable_fc.bias").reshape(1, -1), ttnn.float32)
-        # No permutation: weights_fc already emits (level, point, group) within
-        # a camera, and the camera axis comes from how the linear's rows are
-        # grouped, so the full order is (camera, level, point, group).
         self.PG = self.P * num_groups
         self.Wf = T(g("weights_fc.weight").t())
         self.Bf = T(g("weights_fc.bias").reshape(1, -1))
@@ -249,8 +208,6 @@ class TtDFA:
             gather[q::num_groups, q] = 1.0
         self.gt, self.st = T(gather), T(gather.t().contiguous())
 
-        # 0/1 selectors: offset -> x,y and the fan-out of num_sample anchor
-        # points to num_pts keypoints. Exact under any fidelity.
         H, Lp, P = len(FIX_HEIGHT), NUM_LEARNABLE, self.P
         Ox, Oy = torch.zeros(P * 2, P), torch.zeros(P * 2, P)
         Ax, Ay = torch.zeros(num_sample * 2, P), torch.zeros(num_sample * 2, P)
@@ -261,15 +218,7 @@ class TtDFA:
         self.Ox, self.Oy = T(Ox, ttnn.float32), T(Oy, ttnn.float32)
         self.Ax, self.Ay = T(Ax, ttnn.float32), T(Ay, ttnn.float32)
         self.zc = torch.tensor([FIX_HEIGHT[(p // Lp) % H] for p in range(P)])
-        # grid_precompute's constant pack, built on first use from the level
-        # shapes the feature tensors carry. It depends on nothing else, so all
-        # three DFA instances would build the same one.
         self._consts, self._consts_key = None, None
-        # gws runs per level, so its reduction is one level's worth of clp.
-        # num_chunks must divide that exactly -- the reader hands the compute
-        # kernel a fixed page count per work unit, and a ragged last chunk
-        # leaves it waiting for pages that never come. The op refuses a ragged
-        # split rather than hanging, but pick a divisor here anyway.
         self.clp_l = num_cams * self.P
         self.nchunks = max(k for k in (GWS_CHUNKS, 25, 20, 15, 12, 10, 8, 6, 5, 4, 3, 2, 1)
                            if self.clp_l % k == 0)
@@ -329,10 +278,6 @@ class TtDFA:
         y = ttnn.add(ttnn.matmul(off, self.Oy, compute_kernel_config=self.hi),
                      ttnn.matmul(anchor32, self.Ay, compute_kernel_config=self.hi))
         ttnn.deallocate(off)
-        # One upload for all nine per-camera constants, sliced apart on device.
-        # They are [1, P] each -- 2 KB -- and from_torch costs per call, not per
-        # byte: nine of them measured 4.6 ms a DFA call, which is more than the
-        # projection arithmetic they feed.
         cst_all = torch.stack(
             [(proj[c][:3, 2] * self.zc.unsqueeze(-1) + proj[c][:3, 3]).t()
              for c in range(self.C)], 0).reshape(self.C * 3, self.P)
@@ -355,27 +300,10 @@ class TtDFA:
                 ttnn.deallocate(q)
         ttnn.deallocate(x); ttnn.deallocate(y); ttnn.deallocate(cst_tt)
 
-        # --- the grid ------------------------------------------------------
-        # POINT-MAJOR: grid_sample emits one output row per grid row, so the
-        # point order IS the feature tensor's axis order, and this one hands
-        # back [C, P, ml, E] -- what gws wants, with no permute. The transpose
-        # that gets there is on a [ml, P] fp32 tensor, 0.06 ms, not on the
-        # 1.46 GiB of sampled features it replaces.
-        # All six coordinate planes go through the Q14 chain and the transpose
-        # as ONE tensor. These are small -- [ml, P] fp32, about a megabyte --
-        # so the chain is launch-bound, not bandwidth-bound, and doing it per
-        # camera meant 54 dispatches where this needs 26. It cost DAF[2], whose
-        # planes are [200, 80], more than the round trip it replaced.
-        uv = ttnn.concat(us + vs, dim=0)                      # [2*C*ml, P]
+        uv = ttnn.concat(us + vs, dim=0)
         q = _q14_bits(uv)
-        t16 = ttnn.to_layout(ttnn.transpose(q, 0, 1), ttnn.ROW_MAJOR_LAYOUT)  # [P, 2*C*ml]
+        t16 = ttnn.to_layout(ttnn.transpose(q, 0, 1), ttnn.ROW_MAJOR_LAYOUT)
         ttnn.deallocate(uv); ttnn.deallocate(q)
-        # A row is GP_K consecutive points of the point-major [P, ml] plane, and
-        # it may straddle a point index when ml is not a multiple of GP_K --
-        # DAF[2] on a mesh has ml = 200. Nothing downstream can tell: a row is
-        # only ever a unit of 16 points to grid_precompute, and grid_sample's
-        # K-batched output flattens back to the same order either way. What has
-        # to divide is P*ml, which is the whole plane.
         rows_c = self.P * ml // GP_K
         blocks = []
         for c in range(self.C):
@@ -383,23 +311,17 @@ class TtDFA:
             sv = ttnn.slice(t16, [0, (self.C + c) * ml], [self.P, (self.C + c + 1) * ml])
             ru = ttnn.reshape(su, (rows_c, GP_K))
             rv = ttnn.reshape(sv, (rows_c, GP_K))
-            blocks.append(ttnn.concat([ru, rv], dim=-1))      # [rows_c, 2*GP_K]
+            blocks.append(ttnn.concat([ru, rv], dim=-1))
             for t in (su, sv, ru, rv):
                 ttnn.deallocate(t)
         ttnn.deallocate(t16)
-        g = ttnn.concat(blocks, dim=0)                        # [C*rows_c, 2*GP_K]
+        g = ttnn.concat(blocks, dim=0)
         g4 = ttnn.reshape(g, (self.C, rows_c, 1, 2 * GP_K))
         g_tt = ttnn.typecast(g4, ttnn.uint16)
         for t in blocks:
             ttnn.deallocate(t)
         ttnn.deallocate(g); ttnn.deallocate(g4)
 
-        # --- the mask base -------------------------------------------------
-        # A camera is silenced at a point only where another camera sees it,
-        # which is also what keeps the softmax denominator non-zero. The
-        # concatenation is in ROW_MAJOR because P = 500 is not a multiple of
-        # the tile width, so three [ml, 500] TILE tensors would concatenate to
-        # 1536 columns, not 1500.
         ib = []
         for c in range(self.C):
             a = ttnn.logical_and(ttnn.gtz(us[c]), ttnn.ltz(ttnn.subtract(us[c], 1.0)))
@@ -431,10 +353,6 @@ class TtDFA:
         sl = t if (a0 == 0 and a1 == n) else ttnn.slice(t, [a0, 0], [a1, t.shape[-1]])
         if self.nd == 1:
             return sl if sl is not t else ttnn.clone(t)
-        # mesh_partition cuts a TILE tensor only on a tile boundary, and the
-        # trajectory branch's 400 rows split into 200 -- which is not one. The
-        # host mapper this replaced could cut anywhere. ROW_MAJOR has no such
-        # constraint, so an unaligned split goes through it and comes back.
         if ((a1 - a0) // self.nd) % 32 == 0:
             r = ttnn.mesh_partition(sl, 0)
         else:
@@ -570,14 +488,6 @@ class TtDFA:
                 f"chunk {m} must divide across {self.nd} devices; "
                 f"pick a chunk that divides {n} into multiples of {self.nd}")
             ml = m // self.nd
-            # feat goes up ONCE. The projection wants it fp32 -- coordinates are
-            # geometry -- and everything else wants bf16, and uploading the same
-            # rows twice cost an upload for nothing.
-            # feat and anchor arrive REPLICATED on device; ttnn.mesh_partition
-            # is all_gather's inverse and hands each chip its own anchors, so
-            # neither has to be uploaded. The projection wants fp32 -- the
-            # coordinates are geometry -- and nothing is lost widening the bf16
-            # the decoder produced, which is what the host path uploaded too.
             fr = self._rows(feat, a0, a1)
             f32 = ttnn.typecast(fr, self.f32) if fr.dtype != ttnn.float32 else fr
             f_tt = ttnn.typecast(f32, ttnn.bfloat16)
@@ -590,53 +500,34 @@ class TtDFA:
                 ttnn.deallocate(a32)
             ttnn.deallocate(fr); ttnn.deallocate(an)
             Wl = self._weights(f_tt, cam, m, base)
-            # h0, w0 and the four bilinear weights, per level, on the Tensix
-            # engines -- 8 ms here against the 232 it takes grid_sample's reader
-            # to derive the same six values in soft float. The outputs are not
-            # zeroed because grid_precompute writes every row of every one.
             rows = ml * self.P // GP_K
             spec = ttnn.TensorSpec(ttnn.Shape([self.C, rows, 1, 6 * GP_K]),
                                    ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT,
                                    ttnn.BufferType.DRAM)
             gp = [ttnn.allocate_tensor_on_device(spec, self.dev) for _ in range(4)]
             ttnn.grid_precompute(g_tt, consts, gp[0], gp[1], gp[2], gp[3], GP_K)
-            # One grouped_weighted_sum per FPN level, straight off what
-            # grid_sample produced for it. There is no [clp, ml, E] tensor:
-            # building one cost a 1.46 GiB concatenation, 27.0 ms a chip, and
-            # four calls measured 22.0 ms against one call's 22.6. The whole
-            # point of keeping clp in (camera, level, point) order is that a
-            # level's weights are then contiguous.
-            #
-            # The partial sums of all four levels add up before coming back, so
-            # the host sees one [ml, E] download instead of four.
             mp_ = ((ml + 31) // 32) * 32
             nc = self.nchunks
             tot = None
             for fm, g, wi in zip(levels_tt, gp, Wl):
-                # The grid is point-major, so this is already [C, P, ml, E] and
-                # the reshape is free -- see _project.
                 s_ = ttnn.grid_sample(fm, g, use_precomputed_grid=True)
                 fi = ttnn.reshape(s_, (self.C * self.P, ml, self.E))
                 o = ttnn.grouped_weighted_sum(fi, wi, num_groups=self.G,
                                               group_dims=self.E // self.G, num_chunks=nc)
-                # o is [nc * mp_, E], one block per partial sum.
                 so = ttnn.reshape(ttnn.sum(ttnn.reshape(o, (nc, mp_, self.E)), dim=0),
                                   (mp_, self.E))
                 tot = so if tot is None else ttnn.add(tot, so)
                 ttnn.deallocate(fi); ttnn.deallocate(o)
                 if tot is not so:
                     ttnn.deallocate(so)
-            # tot is already this device's own anchors, so its slice IS what
-            # self.S(acc) used to re-upload. Downloading it only to send it
-            # straight back was two transfers a call for nothing.
             acc = ttnn.slice(tot, [0, 0], [ml, self.E])
             proj_out = ttnn.linear(acc, self.Wo, bias=self.Bo,
                                    compute_kernel_config=self.hi)
-            res = ttnn.add(proj_out, f_tt)              # [ml, E], this device's anchors
+            res = ttnn.add(proj_out, f_tt)
             g = self._gather(res, m)
             outs.append(g)
             ttnn.deallocate(acc)
-            if g is not res:                            # _gather passes it through at nd == 1
+            if g is not res:
                 ttnn.deallocate(res)
             for t in (f_tt, g_tt, base, tot, proj_out, *gp, *Wl):
                 ttnn.deallocate(t)

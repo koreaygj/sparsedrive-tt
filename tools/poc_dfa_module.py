@@ -52,21 +52,14 @@ def main():
             feat = d[GD + key + "in[0]"][0][:n]
             anchor = d[GD + key + "in[1]"][0][:n]
             ref = d[GD + key + "out"][0][:n]
-            # Warm at the shape that will be timed. A different chunk is a
-            # different tensor shape is a different kernel: warming at 32 and
-            # timing at 128 measures a fresh JIT compile, which is how the traj
-            # call first read 5613 ms for a sixteenth of layer 0's work.
             CH = 128
             proj_tt = dfa.T(proj[:, :3].reshape(dfa.C, -1))
-            # feat/anchor now arrive on device, replicated; the DFA shards them
-            # itself with ttnn.mesh_partition.
             f_tt = dfa.T(feat)
             a_tt = dfa.T(anchor, ttnn.float32)
             dfa(f_tt, a_tt, levels, proj, proj_tt, iwh, chunk=CH)
             ttnn.synchronize_device(dev); t0 = time.time()
             got_tt = dfa(f_tt, a_tt, levels, proj, proj_tt, iwh, chunk=CH)
             ttnn.synchronize_device(dev); dt = (time.time() - t0) * 1e3
-            # the DFA returns a device tensor now, gathered to every chip
             got = dfa.G2T(got_tt).float()[:n]
             p = pcc(got, ref); ok &= p >= 0.999
             print(f"  {key[:-1]:20s} n={n:5d} P={dfa.P:3d} clp={dfa.clp:5d}"

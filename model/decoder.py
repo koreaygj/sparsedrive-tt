@@ -102,21 +102,13 @@ class TtDecoderLayer:
                 pre_attn=None, img=None, ti=None):
         """DFA -> (optional cross-attn) -> self-attn -> norm -> FFN -> norm -> score."""
         T = x.shape[0]
-        # Everything stays on device. Only the SCORES come back, and only
-        # because the top-k has to stay torch.topk: ttnn.topk_select picks the
-        # same k values bit for bit but resolves ties to a different index, and
-        # a different survivor at the boundary is a different trajectory. The
-        # scores are 2 KB; the [T, 256] embedding they used to drag down with
-        # them was 1.4 MB.
         xt = dfa(x, anchor, levels, proj, proj_tt, iwh) if dfa is not None else x
-        if pre_attn is not None:      # velocity branch attends to image tokens first
+        if pre_attn is not None:
             xt = ttnn.add(xt, pre_attn(xt, img, img, tq=T, tk=ti))
         xt = ttnn.add(xt, attn(xt, tq=T))
         xt = _ln(xt, *self.norms[n1])
         xt = ttnn.add(xt, ffn(xt))
         xt = _ln(xt, *self.norms[n2])
-        # The scores stay on device: ttnn.topk_select reads them as one
-        # logical row, so [T, 1] is transposed rather than downloaded.
         sc = mlp(xt)
         row = ttnn.reshape(ttnn.transpose(sc, 0, 1), (1, 1, 1, T))
         ttnn.deallocate(sc)
@@ -133,23 +125,10 @@ class TtDecoderLayer:
             vel_embed, None, None, levels, proj, proj_tt, iwh,
             self.v_attn, self.v_ffn, self.v_mlp, "v_norm1", "v_norm2",
             pre_attn=self.v_img, img=img_tt, ti=n_img)
-        # top-k on device. Its uint32 ROW_MAJOR indices are exactly what
-        # row_gather consumes, so the selection never touches the host: the
-        # scores (4 KB at T=1024) do not come down, and the indices do not go
-        # back up. The path branch gathers its anchor alongside its embedding
-        # -- one row_gather carries both pairs -- which is what removes the
-        # anchor's upload too: layer i+1's anchor is layer i's gathered by the
-        # same indices, never re-derived from the vocabulary on the host.
         pi_tt = _topk(self.dev, p_scores, k_path)
         vi_tt = _topk(self.dev, v_scores, k_vel)
         p_sel, a_sel = _gather2(self.dev, p_out, path_anchor, pi_tt, k_path)
         v_sel, va_sel = _gather2(self.dev, v_out, v_abs, vi_tt, k_vel)
-        # The indices DO come back, 80 bytes of them, because the final answer
-        # is a row of traj_vocab and picking it is a host index either way.
-        # The absolute vocabulary index is gathered by the same indices. The
-        # path branch needs its own call -- row_gather carries two pairs and
-        # that branch already uses both -- and the velocity branch has a spare
-        # slot, so its index rides with its embedding.
         pa_sel, _ = _gather2(self.dev, p_abs, None, pi_tt, k_path)
         for t in (p_scores, v_scores, pi_tt, vi_tt):
             ttnn.deallocate(t)
@@ -176,29 +155,11 @@ class TtDecoderLayer:
         xt = _ln(xt, *self.norms["t_norm1"])
         xt = ttnn.add(xt, self.t_ffn(xt))
         xt = _ln(xt, *self.norms["t_norm2"])
-        # The five logits come down and the score is composed on the HOST, in
-        # fp32. Assembling it on device instead was tried and changed the
-        # answer -- max|d| 2.3 on the trajectory, a different candidate. The
-        # top two candidates sit 1.7e-06 apart in relative terms and bf16
-        # carries about 4e-3, so the sigmoids and the weighted sum have to be
-        # done wider than the device does them by default. Five downloads of
-        # 2 KB is what that costs.
-        # The PDM score is assembled on device and only the winning index
-        # comes back -- four bytes.
-        #
-        # IN FP32, not the default. bf16 was tried and moved the trajectory by
-        # 2.3, a different candidate, and the arithmetic says why: against the
-        # host's fp32 the relative error is 7.6e-03 in bf16 and 8.3e-08 in
-        # fp32, while the top two candidates sit 1.7e-06 apart. bf16 is 4500x
-        # the margin; fp32 is a twentieth of it.
         cols = [ttnn.typecast(self.heads[m](xt), ttnn.float32) for m in V1_METRICS]
         sg = [ttnn.sigmoid(c) for c in cols]
         inner = ttnn.add(ttnn.add(ttnn.multiply(sg[2], 5.0), ttnn.multiply(sg[3], 5.0)),
                          ttnn.multiply(sg[4], 2.0))
         sc = ttnn.multiply(ttnn.multiply(sg[0], sg[1]), inner)
-        # ttnn.argmax hands back [1] uint32 ROW_MAJOR, which is exactly a
-        # row_gather index -- so the winner is picked on device too and the
-        # only thing that comes back is the trajectory itself.
         best = ttnn.argmax(ttnn.reshape(sc, (1, T)), dim=-1)
         for t in cols + sg + [inner, sc]:
             ttnn.deallocate(t)
@@ -229,21 +190,16 @@ class TtDecoder:
                 img_tt, n_img, proj, proj_tt, iwh, self.pf[i], self.vf[i])
 
         n_p, n_v = self.pf[-1], self.vf[-1]
-        # flat[i*n_v + j] = p_abs[i] * n_vel + v_abs[j], the row of the
-        # flattened traj_vocab. fp32 holds it exactly -- the largest is
-        # 1023 * 256 + 255 = 262143 -- and the typecast is the last step.
         flat = ttnn.add(ttnn.multiply(p_abs, float(n_vel)),
-                        ttnn.reshape(v_abs, (1, n_v)))          # [n_p, n_v]
+                        ttnn.reshape(v_abs, (1, n_v)))
         fi = ttnn.to_layout(
             ttnn.typecast(ttnn.reshape(flat, (1, 1, 1, n_p * n_v)), ttnn.uint32),
             ttnn.ROW_MAJOR_LAYOUT)
-        # One row_gather takes the anchor and the candidate poses together.
         t_anchor = _like(self.dev, tv_xy, n_p * n_v)
         cands = _like(self.dev, tv_all, n_p * n_v)
         ttnn.row_gather(tv_xy, fi, t_anchor, tv_all, cands, n_p * n_v)
         best = self.layers[-1].trajectory(path_embed, vel_embed, t_anchor, levels,
                                           proj, proj_tt, iwh)
-        # The winning row, and nothing else, comes back.
         win = _like(self.dev, cands, 1)
         ttnn.row_gather(cands, best, win, None, None, 1)
         out = to_host(win, self.dev).float()[0].reshape(poses, 3)
