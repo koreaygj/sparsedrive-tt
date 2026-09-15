@@ -39,10 +39,14 @@ short version:
     in blocks, and the clp reduction is split to bound the bf16 accumulator.
 """
 
+import os
+
 import torch
 import ttnn
 
 from .mesh import fabric_on
+
+_MESH_PARTITION = os.environ.get("TT_MESH_PARTITION") == "1"
 
 def _cast(x, dt):
     """Convert on the host before handing the tensor over.
@@ -346,20 +350,36 @@ class TtDFA:
     def _rows(self, t, a0, a1):
         """Rows [a0, a1) of a replicated device tensor, sharded by anchor.
 
-        mesh_partition is the inverse of the all_gather in _gather: each chip
-        keeps the i/nd-th slice. 0.17 ms at 1024 rows, and exact.
+        ttnn.mesh_partition does this on device in 0.17 ms and is exact, but it
+        is a CCL op, and a run hung inside it -- enqueue_mesh_workload ->
+        fetch_queue_reserve_back, with the whole board wedged afterwards. Every
+        hang this port has seen came after mesh_partition entered the hot path.
+        That is not proof it is the culprit, because fetch_queue_reserve_back
+        blocks on a queue that something EARLIER failed to drain, so the op
+        that reports the hang is only the next one enqueued. But it is a CCL op
+        on a two-chip mesh, --fabric raises the failure rate sharply, and the
+        cheap alternative costs about 3 ms a call: down to the host and back up
+        through ShardTensorToMesh, which is what this did before and what ran
+        for a whole navtest without incident.
+
+        TT_MESH_PARTITION=1 restores the device path for an A/B.
         """
         n = t.shape[0]
         sl = t if (a0 == 0 and a1 == n) else ttnn.slice(t, [a0, 0], [a1, t.shape[-1]])
         if self.nd == 1:
             return sl if sl is not t else ttnn.clone(t)
-        if ((a1 - a0) // self.nd) % 32 == 0:
-            r = ttnn.mesh_partition(sl, 0)
+        if _MESH_PARTITION:
+            if ((a1 - a0) // self.nd) % 32 == 0:
+                r = ttnn.mesh_partition(sl, 0)
+            else:
+                rm = ttnn.to_layout(sl, ttnn.ROW_MAJOR_LAYOUT)
+                pr = ttnn.mesh_partition(rm, 0)
+                r = ttnn.to_layout(pr, ttnn.TILE_LAYOUT)
+                ttnn.deallocate(rm); ttnn.deallocate(pr)
         else:
-            rm = ttnn.to_layout(sl, ttnn.ROW_MAJOR_LAYOUT)
-            pr = ttnn.mesh_partition(rm, 0)
-            r = ttnn.to_layout(pr, ttnn.TILE_LAYOUT)
-            ttnn.deallocate(rm); ttnn.deallocate(pr)
+            h = self.G2T(sl)[:a1 - a0].contiguous()
+            r = ttnn.from_torch(h, layout=ttnn.TILE_LAYOUT, device=self.dev,
+                                dtype=sl.dtype, mesh_mapper=self.sh0)
         if sl is not t:
             ttnn.deallocate(sl)
         return r
