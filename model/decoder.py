@@ -155,6 +155,8 @@ class TtDecoderLayer:
     def trajectory(self, p_emb, v_emb, traj_anchor, levels, proj, proj_tt, iwh):
         """Last layer only: 20 paths x 20 velocities -> 400 candidates.
 
+        Returns the winning candidate's index.
+
         The outer sum runs on device: [n_p, 1, E] + [1, n_v, E] broadcast, then
         flattened. p_emb and v_emb are what row_gather selected, so nothing has
         touched the host since the FPN.
@@ -178,24 +180,24 @@ class TtDecoderLayer:
         # carries about 4e-3, so the sigmoids and the weighted sum have to be
         # done wider than the device does them by default. Five downloads of
         # 2 KB is what that costs.
-        # The five logits ride down as one [T, 5] tensor -- five separate
-        # downloads of a [T, 1] column cost five call overheads for 2 KB each.
-        # The sigmoids and the weighted sum stay on the HOST, in fp32.
-        # Composing them on device was tried and moved the trajectory by 2.3,
-        # a different candidate: the top two sit 1.7e-06 apart in relative
-        # terms and bf16 carries about 4e-3.
-        cols = [self.heads[m](xt) for m in V1_METRICS]
-        packed = ttnn.concat(cols, dim=-1)
-        h5 = to_host(packed, self.dev).float()[:T]
-        for t in cols + [packed]:
+        # The PDM score is assembled on device and only the winning index
+        # comes back -- four bytes.
+        #
+        # IN FP32, not the default. bf16 was tried and moved the trajectory by
+        # 2.3, a different candidate, and the arithmetic says why: against the
+        # host's fp32 the relative error is 7.6e-03 in bf16 and 8.3e-08 in
+        # fp32, while the top two candidates sit 1.7e-06 apart. bf16 is 4500x
+        # the margin; fp32 is a twentieth of it.
+        cols = [ttnn.typecast(self.heads[m](xt), ttnn.float32) for m in V1_METRICS]
+        sg = [ttnn.sigmoid(c) for c in cols]
+        inner = ttnn.add(ttnn.add(ttnn.multiply(sg[2], 5.0), ttnn.multiply(sg[3], 5.0)),
+                         ttnn.multiply(sg[4], 2.0))
+        sc = ttnn.multiply(ttnn.multiply(sg[0], sg[1]), inner)
+        best = int(to_host(ttnn.argmax(ttnn.reshape(sc, (1, T)), dim=-1), self.dev)
+                   .reshape(-1)[0])
+        for t in cols + sg + [inner, sc]:
             ttnn.deallocate(t)
-        lg = {m: h5[:, i] for i, m in enumerate(V1_METRICS)}
-        scores = (torch.sigmoid(lg["no_at_fault_collisions"])
-                  * torch.sigmoid(lg["drivable_area_compliance"])) * (
-            5 * torch.sigmoid(lg["time_to_collision_within_bound"])
-            + 5 * torch.sigmoid(lg["ego_progress"])
-            + 2 * torch.sigmoid(lg["comfort"]))
-        return scores
+        return best
 
 
 class TtDecoder:
@@ -230,6 +232,6 @@ class TtDecoder:
         tv = traj_vocab[p_abs][:, v_abs]                    # [20, 20, poses, 3]
         t_anchor = _t(tv[..., :2].reshape(-1, tv.shape[2] * 2), self.dev,
                       dtype=ttnn.float32)                   # [400, poses*2]
-        scores = last.trajectory(path_embed, vel_embed, t_anchor, levels,
-                                 proj, proj_tt, iwh)
-        return tv.reshape(-1, tv.shape[2], tv.shape[3])[int(scores.argmax())]
+        best = last.trajectory(path_embed, vel_embed, t_anchor, levels,
+                               proj, proj_tt, iwh)
+        return tv.reshape(-1, tv.shape[2], tv.shape[3])[best]
