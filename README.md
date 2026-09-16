@@ -67,6 +67,35 @@ split changes the accumulation order.
 source env.sh
 ```
 
+Paths live in `env.yaml`, so a different machine edits that and leaves the
+script alone. Relative paths resolve against the repo root and a leading `~`
+expands:
+
+```yaml
+devkit_root: ../SparseDriveV2                          # the SparseDriveV2 checkout
+data_root: dataset                                     # symlinks into the real dataset
+exp_root: exp                                          # caches, logs, trajectories
+map_version: nuplan-maps-v1.0
+
+tt_metal_home: ~/project/tenstorrent/tt-metal          # the tt-metal carrying this port's ops
+arch_name: wormhole_b0
+
+navsim_py: ~/miniconda3/envs/navsim-sm120/bin/python
+tt_py: ~/.tenstorrent-venv/bin/python
+```
+
+Flat `key: value` only — `env.sh` parses it with `sed`, not a YAML library,
+because it is the file that decides which interpreter exists. An already
+exported variable always wins, so a one-off override needs no edit:
+
+```bash
+TT_PY=/other/python source env.sh          # this run only
+SPARSEDRIVE_ENV_YAML=~/other.yaml source env.sh
+```
+
+`source env.sh` prints every resolved path with `ok` or `MISSING`, which is the
+quickest check that a new machine is wired up.
+
 ### Data
 
 `dataset/` holds symlinks into `/mnt/data2/navsim-test`, renamed the way

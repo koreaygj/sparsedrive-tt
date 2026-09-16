@@ -31,15 +31,23 @@ unset _sd_src
 # already-exported value is never silently replaced.
 _sd_yaml="${SPARSEDRIVE_ENV_YAML:-$SPARSEDRIVE_TT_ROOT/env.yaml}"
 
-# _sd_cfg <key> <default> -> value, with ~ expanded and relative paths made
-# absolute against the repo root.
-_sd_cfg() {
+# _sd_val <key> <default> -> the value as written. Use for plain scalars.
+_sd_val() {
   _sd_v=""
   if [ -f "$_sd_yaml" ]; then
     _sd_v="$(sed -n "s/^[[:space:]]*$1[[:space:]]*:[[:space:]]*//p" "$_sd_yaml" \
              | head -n 1 | sed 's/[[:space:]]*#.*$//; s/[[:space:]]*$//; s/^["'"'"']//; s/["'"'"']$//')"
   fi
   [ -n "$_sd_v" ] || _sd_v="$2"
+  printf '%s' "$_sd_v"
+}
+
+# _sd_cfg <key> <default> -> the value as a path: ~ expanded, relative resolved
+# against the repo root, normalised if it exists. Only for keys that ARE paths.
+# arch_name and map_version are not, and prefixing the repo root onto those
+# silently produced $SPARSEDRIVE_TT_ROOT/wormhole_b0.
+_sd_cfg() {
+  _sd_v="$(_sd_val "$1" "$2")"
   case "$_sd_v" in
     "~"|"~/"*) _sd_v="$HOME${_sd_v#\~}" ;;
   esac
@@ -68,7 +76,7 @@ export NAVSIM_DEVKIT_ROOT="${SPARSEDRIVE_DEVKIT_ROOT:-$(_sd_cfg devkit_root "$(d
 #   dataset/maps
 export OPENSCENE_DATA_ROOT="$(_sd_cfg data_root "$SPARSEDRIVE_TT_ROOT/dataset")"
 export NUPLAN_MAPS_ROOT="$OPENSCENE_DATA_ROOT/maps"
-export NUPLAN_MAP_VERSION="$(_sd_cfg map_version nuplan-maps-v1.0)"
+export NUPLAN_MAP_VERSION="$(_sd_val map_version nuplan-maps-v1.0)"
 
 # --- experiment output (caches, logs, checkpoints written by runs) -------------
 export NAVSIM_EXP_ROOT="$(_sd_cfg exp_root "$SPARSEDRIVE_TT_ROOT/exp")"
@@ -87,7 +95,7 @@ if [ -n "$TT_METAL_HOME" ] && [ "$TT_METAL_HOME" != "$_sd_want" ]; then
 fi
 export TT_METAL_HOME="$_sd_want"
 unset _sd_want
-export ARCH_NAME="${ARCH_NAME:-$(_sd_cfg arch_name wormhole_b0)}"
+export ARCH_NAME="${ARCH_NAME:-$(_sd_val arch_name wormhole_b0)}"
 
 # --- interpreters -------------------------------------------------------------
 # navsim-sm120 = a clone of the `sparse` env with torch swapped to 2.8.0+cu128,
@@ -126,4 +134,4 @@ for _sd_v in SPARSEDRIVE_TT_ROOT NAVSIM_DEVKIT_ROOT OPENSCENE_DATA_ROOT NUPLAN_M
   printf '  %-20s %s%s\n' "$_sd_v" "$_sd_p" "$_sd_mark"
 done
 unset _sd_v _sd_p _sd_mark _sd_yaml
-unset -f _sd_cfg 2>/dev/null || true
+unset -f _sd_cfg _sd_val 2>/dev/null || true
