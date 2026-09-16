@@ -98,11 +98,11 @@ class TtDecoderLayer:
             self.heads = {m: TtFFN(sd, prefix + f"metric_heads.{m}.", device)
                           for m in V1_METRICS}
 
-    def _branch(self, x, dfa, anchor, levels, proj, proj_tt, iwh, attn, ffn, mlp, n1, n2,
+    def _branch(self, x, dfa, anchor, levels, proj_tt, attn, ffn, mlp, n1, n2,
                 pre_attn=None, img=None, ti=None):
         """DFA -> (optional cross-attn) -> self-attn -> norm -> FFN -> norm -> score."""
         T = x.shape[0]
-        xt = dfa(x, anchor, levels, proj, proj_tt, iwh) if dfa is not None else x
+        xt = dfa(x, anchor, levels, proj_tt) if dfa is not None else x
         if pre_attn is not None:
             xt = ttnn.add(xt, pre_attn(xt, img, img, tq=T, tk=ti))
         xt = ttnn.add(xt, attn(xt, tq=T))
@@ -115,14 +115,14 @@ class TtDecoderLayer:
         return xt, row
 
     def __call__(self, path_embed, vel_embed, path_anchor, p_abs, v_abs, status,
-                 levels, img_tt, n_img, proj, proj_tt, iwh, k_path, k_vel):
+                 levels, img_tt, n_img, proj_tt, k_path, k_vel):
         path_embed = ttnn.add(path_embed, status)
         vel_embed = ttnn.add(vel_embed, status)
         p_out, p_scores = self._branch(
-            path_embed, self.p_dfa, path_anchor, levels, proj, proj_tt, iwh,
+            path_embed, self.p_dfa, path_anchor, levels, proj_tt,
             self.p_attn, self.p_ffn, self.p_mlp, "p_norm1", "p_norm2")
         v_out, v_scores = self._branch(
-            vel_embed, None, None, levels, proj, proj_tt, iwh,
+            vel_embed, None, None, levels, proj_tt,
             self.v_attn, self.v_ffn, self.v_mlp, "v_norm1", "v_norm2",
             pre_attn=self.v_img, img=img_tt, ti=n_img)
         pi_tt = _topk(self.dev, p_scores, k_path)
@@ -134,7 +134,7 @@ class TtDecoderLayer:
             ttnn.deallocate(t)
         return p_sel, v_sel, a_sel, pa_sel, va_sel
 
-    def trajectory(self, p_emb, v_emb, traj_anchor, levels, proj, proj_tt, iwh):
+    def trajectory(self, p_emb, v_emb, traj_anchor, levels, proj_tt):
         """Last layer only: 20 paths x 20 velocities -> 400 candidates.
 
         Returns the winning candidate's index.
@@ -149,7 +149,7 @@ class TtDecoderLayer:
             ttnn.add(ttnn.reshape(p_emb, (n_p, 1, E)), ttnn.reshape(v_emb, (1, n_v, E))),
             (n_p * n_v, E))
         T = n_p * n_v
-        xt = self.t_dfa(traj, traj_anchor, levels, proj, proj_tt, iwh)
+        xt = self.t_dfa(traj, traj_anchor, levels, proj_tt)
         ttnn.deallocate(traj)
         xt = ttnn.add(xt, self.t_attn(xt, tq=T))
         xt = _ln(xt, *self.norms["t_norm1"])
@@ -174,9 +174,12 @@ class TtDecoder:
                        for i in range(2)]
 
     def __call__(self, path_embed, vel_embed, anchor_tt, status,
-                 levels, img_tt, n_img, proj, proj_tt, iwh,
+                 levels, img_tt, n_img, proj_tt,
                  tv_all, tv_xy, p_abs0, v_abs0, n_vel, poses):
-        """Returns the selected trajectory [num_poses, 3].
+        """Returns the winning trajectory as a DEVICE tensor, [1, poses*3].
+
+        Not read here: a trace capture refuses reads, so the caller does it
+        after the replay, off the same buffer.
 
         Everything but the scores and the final answer stays on device.
         `anchor_tt` is path_vocab[..., :2] flattened, uploaded once at load --
@@ -187,7 +190,7 @@ class TtDecoder:
         for i, layer in enumerate(self.layers):
             path_embed, vel_embed, anchor, p_abs, v_abs = layer(
                 path_embed, vel_embed, anchor, p_abs, v_abs, status, levels,
-                img_tt, n_img, proj, proj_tt, iwh, self.pf[i], self.vf[i])
+                img_tt, n_img, proj_tt, self.pf[i], self.vf[i])
 
         n_p, n_v = self.pf[-1], self.vf[-1]
         flat = ttnn.add(ttnn.multiply(p_abs, float(n_vel)),
@@ -199,10 +202,9 @@ class TtDecoder:
         cands = _like(self.dev, tv_all, n_p * n_v)
         ttnn.row_gather(tv_xy, fi, t_anchor, tv_all, cands, n_p * n_v)
         best = self.layers[-1].trajectory(path_embed, vel_embed, t_anchor, levels,
-                                          proj, proj_tt, iwh)
+                                          proj_tt)
         win = _like(self.dev, cands, 1)
         ttnn.row_gather(cands, best, win, None, None, 1)
-        out = to_host(win, self.dev).float()[0].reshape(poses, 3)
-        for t in (flat, fi, t_anchor, cands, best, win):
+        for t in (flat, fi, t_anchor, cands, best):
             ttnn.deallocate(t)
-        return out
+        return win

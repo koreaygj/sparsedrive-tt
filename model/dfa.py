@@ -46,7 +46,23 @@ import ttnn
 
 from .mesh import fabric_on
 
-_MESH_PARTITION = os.environ.get("TT_MESH_PARTITION") == "1"
+def _ccl_subgrid():
+    """Pin the all_gather workers to one row, or None to let ttnn place them.
+
+    TT_CCL_ROW=<y> names a logical row, and it must be a row the compute grid
+    COVERS. sub_core_grids is intersected with the compute grid, so naming a
+    row outside it yields an empty set and all_gather dies on
+    "Cannot get bounding_box of an empty CoreRangeSet". Reserving cores that
+    ops cannot touch needs the SubDevice API instead, not this argument.
+
+    Off unless the env var is set, so the default keeps ttnn's own placement.
+    """
+    row = os.environ.get("TT_CCL_ROW")
+    if not row:
+        return None
+    y = int(row)
+    return ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, y), ttnn.CoreCoord(7, y))])
+
 
 def _cast(x, dt):
     """Convert on the host before handing the tensor over.
@@ -174,10 +190,12 @@ class TtDFA:
         """
         self.dev, self.C, self.L, self.G, self.E = device, num_cams, num_levels, num_groups, embed_dims
         self.nd = device.get_num_devices() if hasattr(device, "get_num_devices") else 1
+        self.mp = os.environ.get("TT_MESH_PARTITION") == "1"
         self.rep = ttnn.ReplicateTensorToMesh(device) if self.nd > 1 else None
         self.sh0 = ttnn.ShardTensorToMesh(device, dim=0) if self.nd > 1 else None
         self.sh1 = ttnn.ShardTensorToMesh(device, dim=1) if self.nd > 1 else None
         self.cat0 = ttnn.ConcatMeshToTensor(device, dim=0) if self.nd > 1 else None
+        self.ccl_grid = _ccl_subgrid()
         self.ns = num_sample
         self.P = num_sample * len(FIX_HEIGHT) * NUM_LEARNABLE
         self.clp = num_cams * num_levels * self.P
@@ -246,6 +264,11 @@ class TtDFA:
         frame after it. As tensor rows they live in a buffer the caller can
         refill, which is what makes the DFA traceable.
 
+        Written into a buffer allocated once, not uploaded fresh: allocating a
+        device buffer while a trace is alive moves the allocator underneath the
+        addresses the trace recorded, and the replay then reads someone else's
+        memory. That was worth a wrong trajectory, 5.7e-02 off.
+
         Rows are k * (C*3) + c*3 + i:
             k=0  a    the x coefficient of plane i of camera c
             k=1  b    the y coefficient
@@ -262,7 +285,14 @@ class TtDFA:
             blk[2, c * 3:c * 3 + 3] = (Pm[:3, 2] * self.zc.unsqueeze(-1) + Pm[:3, 3]).t()
             blk[3, c * 3 + 0] = 1.0 / float(iwh[c, 0])
             blk[3, c * 3 + 1] = 1.0 / float(iwh[c, 1])
-        self.pc_tt = self.T(blk.reshape(4 * R, self.P), self.f32)
+        if self.pc_tt is None:
+            self.pc_tt = ttnn.allocate_tensor_on_device(
+                ttnn.TensorSpec(ttnn.Shape([4 * R, self.P]), self.f32,
+                                ttnn.TILE_LAYOUT, ttnn.BufferType.DRAM), self.dev)
+        ttnn.copy_host_to_device_tensor(
+            ttnn.from_torch(blk.reshape(4 * R, self.P).contiguous(), dtype=self.f32,
+                            layout=ttnn.TILE_LAYOUT, mesh_mapper=self.rep),
+            self.pc_tt)
 
     def _gp_pack(self, levels_tt):
         key = tuple((int(t.shape[1]), int(t.shape[2])) for t in levels_tt)
@@ -286,7 +316,7 @@ class TtDFA:
                                                      compute_kernel_config=self.hi)),
                                weight=self.ln_w[1], bias=self.ln_b[1])
 
-    def _project(self, feat32, anchor32, n, proj, iwh):
+    def _project(self, feat32, anchor32, n):
         """-> (Q14 grid [C, P*ml/GP_K, 1, 2*GP_K] uint16, mask base [ml, C*P]).
 
         Both are built on device. u and v used to come back to the host, be
@@ -394,7 +424,7 @@ class TtDFA:
         sl = t if (a0 == 0 and a1 == n) else ttnn.slice(t, [a0, 0], [a1, t.shape[-1]])
         if self.nd == 1:
             return sl if sl is not t else ttnn.clone(t)
-        if _MESH_PARTITION:
+        if self.mp:
             if ((a1 - a0) // self.nd) % 32 == 0:
                 r = ttnn.mesh_partition(sl, 0)
             else:
@@ -423,6 +453,9 @@ class TtDFA:
         if self.nd == 1:
             return res
         if fabric_on():
+            if self.ccl_grid is not None:
+                return ttnn.all_gather(res, dim=0, topology=ttnn.Topology.Linear,
+                                       sub_core_grids=self.ccl_grid)
             return ttnn.all_gather(res, dim=0, topology=ttnn.Topology.Linear)
         return ttnn.from_torch(
             self.G2T(res).float()[:m].bfloat16().contiguous(), layout=ttnn.TILE_LAYOUT,
@@ -493,8 +526,7 @@ class TtDFA:
         ttnn.deallocate(w)
         return per
 
-    def __call__(self, feat, anchor, levels_tt, proj, proj_tt, iwh,
-                 chunk=1024, splits=None):
+    def __call__(self, feat, anchor, levels_tt, proj_tt, chunk=1024, splits=None):
         """feat [n, E] torch, anchor [n, num_sample*2] torch. -> [n, E] torch.
 
         Big blocks. Measured on DAF[0], PCC identical to six decimals at every
@@ -526,8 +558,7 @@ class TtDFA:
             f"{GP_K}-point grid rows")
         cam = self._camera_embed(proj_tt)
         consts = self._gp_pack(levels_tt)
-        if getattr(self, "pc_tt", None) is None:
-            self.prepare_proj(proj, iwh)
+        assert self.pc_tt is not None, "call prepare_proj() before the frame"
         outs = []
         for a0 in range(0, n, chunk):
             a1 = min(a0 + chunk, n)
@@ -541,7 +572,7 @@ class TtDFA:
             f_tt = ttnn.typecast(f32, ttnn.bfloat16)
             an = self._rows(anchor, a0, a1)
             a32 = ttnn.typecast(an, self.f32) if an.dtype != ttnn.float32 else an
-            g_tt, base = self._project(f32, a32, m, proj, iwh)
+            g_tt, base = self._project(f32, a32, m)
             if f32 is not fr:
                 ttnn.deallocate(f32)
             if a32 is not an:

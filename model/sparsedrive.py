@@ -59,16 +59,45 @@ class TtSparseDrive:
         self.v_abs0 = _t(torch.arange(n_vel).float().reshape(-1, 1), device,
                          dtype=ttnn.float32)
         self.n_vel = n_vel
+        self.img_buf = self.st_buf = self.pj_buf = None
+        self.trace_id = self.trace_out = None
+        self._dfas = [d for L in self.decoder.layers
+                      for d in (L.p_dfa, getattr(L, "t_dfa", None)) if d is not None]
 
-    def features(self, imgs):
-        """imgs [cams, 3, H, W] -> per-level ttnn NHWC + the image tokens."""
-        x = torch.nn.functional.pad(imgs.permute(0, 2, 3, 1), (0, 1))
+    def _buf(self, shape, dtype, layout):
+        return ttnn.allocate_tensor_on_device(
+            ttnn.TensorSpec(ttnn.Shape(shape), dtype, layout, ttnn.BufferType.DRAM),
+            self.dev)
+
+    def prepare(self, imgs, status_feature, proj, iwh):
+        """Every host write for one frame, into buffers allocated once.
+
+        Trace capture refuses host writes, so a traceable frame has to read its
+        inputs from device tensors whose addresses do not move. This fills
+        them; forward() below touches nothing but the device.
+        """
         n4 = self.C * self.H * self.W
-        xt = ttnn.reshape(
-            ttnn.from_torch(x.reshape(1, 1, n4 * 4 // 256, 256).bfloat16().contiguous(),
-                            dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT,
-                            device=self.dev, mesh_mapper=_mapper(self.dev)[1]),
-            (1, 1, n4, 4))
+        if self.img_buf is None:
+            self.img_buf = self._buf([1, 1, n4 * 4 // 256, 256], ttnn.bfloat16,
+                                     ttnn.ROW_MAJOR_LAYOUT)
+            self.st_buf = self._buf([1, status_feature.numel()], ttnn.bfloat16,
+                                    ttnn.TILE_LAYOUT)
+            self.pj_buf = self._buf([self.C, 12], ttnn.bfloat16, ttnn.TILE_LAYOUT)
+        x = torch.nn.functional.pad(imgs.permute(0, 2, 3, 1), (0, 1))
+        for host, devt in (
+                (x.reshape(1, 1, n4 * 4 // 256, 256).bfloat16().contiguous(), self.img_buf),
+                (status_feature.reshape(1, -1).bfloat16().contiguous(), self.st_buf),
+                (proj[:, :3].reshape(self.C, -1).bfloat16().contiguous(), self.pj_buf)):
+            ttnn.copy_host_to_device_tensor(
+                ttnn.from_torch(host, dtype=devt.dtype, layout=devt.layout,
+                                mesh_mapper=_mapper(self.dev)[1]), devt)
+        for dfa in self._dfas:
+            dfa.prepare_proj(proj, iwh)
+
+    def features(self):
+        """-> per-level ttnn NHWC + the image tokens, from self.img_buf."""
+        n4 = self.C * self.H * self.W
+        xt = ttnn.reshape(self.img_buf, (1, 1, n4, 4))
         outs = self.fpn(self.backbone(xt))
         levels, last = [], None
         for (t, h, w, c) in outs:
@@ -81,15 +110,59 @@ class TtSparseDrive:
         v, h, w, c = last
         return levels, ttnn.reshape(v, (self.C * h * w, c)), self.C * h * w
 
-    def __call__(self, imgs, status_feature, proj, iwh):
-        levels, img_tt, n_img = self.features(imgs)
-        status = ttnn.linear(_t(status_feature.reshape(1, -1), self.dev),
-                             self.w_st, bias=self.b_st,
+    def read(self, win):
+        """The device tensor forward() returns -> [poses, 3] on the host."""
+        return to_host(win, self.dev).float()[0].reshape(self.poses, 3)
+
+    def forward(self):
+        """One frame, device only: no host reads, no host writes, so it can be
+        captured with ttnn.begin_trace_capture. Returns a device tensor."""
+        levels, img_tt, n_img = self.features()
+        status = ttnn.linear(self.st_buf, self.w_st, bias=self.b_st,
                              compute_kernel_config=self.cfg)
         pe = self.path_pos(self.pv_tt)
         ve = self.vel_pos(self.vv_tt)
-        proj_tt = _t(proj[:, :3].reshape(self.C, -1), self.dev)
         return self.decoder(pe, ve, self.anchor_tt, status, levels, img_tt, n_img,
-                            proj, proj_tt, iwh,
-                            self.tv_all, self.tv_xy, self.p_abs0, self.v_abs0,
-                            self.n_vel, self.poses)
+                            self.pj_buf, self.tv_all, self.tv_xy,
+                            self.p_abs0, self.v_abs0, self.n_vel, self.poses)
+
+    def capture(self, imgs, status_feature, proj, iwh):
+        """Record one frame as a trace, so a replay is ONE dispatch.
+
+        Not for speed: the frame is compute-bound and a replay measured the
+        same as the eager path, 126.1 ms against 125.9. It is for the hang.
+        Eager, a frame pushes several hundred programs through the command
+        queue -- and that queue reaches the second chip over the ethernet
+        tunnel, where the dispatch kernels wait on each other's credits. Every
+        hang this port has seen has been those kernels stuck in TAPW/DAPW, at
+        50 to 7700 tokens apart. A trace turns hundreds of chances per frame
+        into one.
+
+        Warm up before calling this: the program cache has to be populated,
+        and nothing may allocate a device buffer between capture and replay or
+        the recorded addresses stop meaning what they meant.
+        """
+        self.prepare(imgs, status_feature, proj, iwh)
+        self.forward()                              # warm the cache
+        self.prepare(imgs, status_feature, proj, iwh)
+        self.trace_id = ttnn.begin_trace_capture(self.dev, cq_id=0)
+        self.trace_out = self.forward()
+        ttnn.end_trace_capture(self.dev, self.trace_id, cq_id=0)
+        ttnn.synchronize_device(self.dev)
+        return self
+
+    def replay(self, imgs, status_feature, proj, iwh):
+        self.prepare(imgs, status_feature, proj, iwh)
+        ttnn.execute_trace(self.dev, self.trace_id, cq_id=0, blocking=True)
+        return self.read(self.trace_out)
+
+    def release(self):
+        if self.trace_id is not None:
+            ttnn.release_trace(self.dev, self.trace_id)
+            self.trace_id = None
+
+    def __call__(self, imgs, status_feature, proj, iwh):
+        if self.trace_id is not None:
+            return self.replay(imgs, status_feature, proj, iwh)
+        self.prepare(imgs, status_feature, proj, iwh)
+        return self.read(self.forward())

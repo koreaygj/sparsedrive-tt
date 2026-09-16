@@ -54,11 +54,12 @@ def main():
             ref = d[GD + key + "out"][0][:n]
             CH = 128
             proj_tt = dfa.T(proj[:, :3].reshape(dfa.C, -1))
+            dfa.prepare_proj(proj, iwh)
             f_tt = dfa.T(feat)
             a_tt = dfa.T(anchor, ttnn.float32)
-            dfa(f_tt, a_tt, levels, proj, proj_tt, iwh, chunk=CH)
+            dfa(f_tt, a_tt, levels, proj_tt, chunk=CH)
             ttnn.synchronize_device(dev); t0 = time.time()
-            got_tt = dfa(f_tt, a_tt, levels, proj, proj_tt, iwh, chunk=CH)
+            got_tt = dfa(f_tt, a_tt, levels, proj_tt, chunk=CH)
             ttnn.synchronize_device(dev); dt = (time.time() - t0) * 1e3
             got = dfa.G2T(got_tt).float()[:n]
             p = pcc(got, ref); ok &= p >= 0.999

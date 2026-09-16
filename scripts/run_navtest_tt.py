@@ -68,9 +68,18 @@ import pathlib
 import pickle
 import sys
 import time
+import traceback
 
 import torch
-import ttnn
+
+os.environ.setdefault("TT_METAL_OPERATION_TIMEOUT_SECONDS", "50")
+os.environ.setdefault(
+    "TT_METAL_DISPATCH_TIMEOUT_COMMAND_TO_EXECUTE",
+    str(pathlib.Path(os.environ["TT_METAL_HOME"]) / "tools" / "tt-triage.py")
+    + " -v --llm-output-path=/tmp/triage_hang.csv")
+os.environ["PATH"] = f"{pathlib.Path(sys.executable).parent}:{os.environ['PATH']}"
+
+import ttnn  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -88,6 +97,15 @@ def main():
     ap.add_argument("--out", default=str(EXP / "tt_traj.pt"))
     ap.add_argument("--single", action="store_true", help="one chip instead of the mesh")
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--tokens-from", default="",
+                    help="score only the tokens keyed in this .pt, in its order; "
+                         "the scene loader and the cache glob disagree on order, "
+                         "so this is how a TT run lines up with a reference dump")
+    ap.add_argument("--trace", action="store_true",
+                    help="capture the frame once and replay it; one dispatch a "
+                         "frame instead of several hundred. Implies --fabric "
+                         "and the device-side shard, both of which a trace can "
+                         "hold and a host round trip cannot")
     ap.add_argument("--fabric", action="store_true",
                     help="enable FABRIC_1D so the DFA gathers its output with "
                          "ttnn.all_gather; see the note above -- broken on this "
@@ -100,6 +118,10 @@ def main():
     args = ap.parse_args()
 
     files = sorted((EXP / "data_cache_navtest").glob("*/*/sparsedrive_feature.gz"))
+    if args.tokens_from:
+        want = torch.load(args.tokens_from, map_location="cpu", weights_only=False)
+        by_token = {f.parent.name: f for f in files}
+        files = [by_token[t] for t in want if t in by_token]
     if args.limit:
         files = files[:args.limit]
     out = pathlib.Path(args.out)
@@ -110,10 +132,15 @@ def main():
     print(f"  {len(files)} tokens  ({len(done)} already done, skipped)", flush=True)
 
     sd = torch.load(CKPT, map_location="cpu", weights_only=False)["state_dict"]
-    if args.fabric:
+    if args.trace:
+        os.environ["TT_MESH_PARTITION"] = "1"
+    if args.fabric or (args.trace and not args.single):
         enable_fabric()
-    dev = (ttnn.open_device(device_id=0, l1_small_size=24576) if args.single
-           else ttnn.open_mesh_device(ttnn.MeshShape(1, 2), l1_small_size=24576))
+    trs = 200 * 1024 * 1024 if args.trace else 0
+    dev = (ttnn.open_device(device_id=0, l1_small_size=24576, trace_region_size=trs)
+           if args.single else
+           ttnn.open_mesh_device(ttnn.MeshShape(1, 2), l1_small_size=24576,
+                                 trace_region_size=trs))
     try:
         net = TtSparseDrive(sd, dev)
 
@@ -121,17 +148,44 @@ def main():
             with gzip.open(f, "rb") as fh:
                 return f.parent.name, build(pickle.load(fh))
 
+        traced = [False]
+
+        def run(a):
+            if args.trace and not traced[0]:
+                net.capture(*a)
+                traced[0] = True
+            return net(*a).cpu()
+
         t_feat = t_run = 0.0
         t0 = time.time()
+        first = []
+
+        def mark(i, c):
+            """Frame 0 pays for the kernel JIT and, under --trace, the capture.
+
+            That is 70-80 s against a 0.13 s steady frame, so folding it into a
+            running average drags the reported rate down for thousands of
+            frames and inflates the ETA several-fold. Record it once and report
+            everything after it instead.
+            """
+            if i == 0:
+                first[:] = [c - t0, t_run, t_feat]
+                print(f"    frame 0 {first[0]:.1f} s (JIT"
+                      f"{' + trace capture' if args.trace else ''})", flush=True)
 
         def report(i):
             if (i + 1) % 25 and i + 1 != len(files):
                 return
+            n = i + 1
             el = time.time() - t0
-            rate = (i + 1) / el
-            print(f"    {i+1}/{len(files)}  {rate:.2f} fps  "
-                  f"feat {t_feat/(i+1)*1e3:.0f} ms  model {t_run/(i+1)*1e3:.0f} ms  "
-                  f"eta {(len(files)-i-1)/rate/60:.0f} min", flush=True)
+            if first and n > 1:
+                rate = (n - 1) / (el - first[0])
+                ff, fm = (t_feat - first[2]) / (n - 1), (t_run - first[1]) / (n - 1)
+            else:
+                rate, ff, fm = n / el, t_feat / n, t_run / n
+            print(f"    {n}/{len(files)}  {rate:.2f} fps  "
+                  f"feat {ff*1e3:.0f} ms  model {fm*1e3:.0f} ms  "
+                  f"eta {(len(files)-n)/rate/60:.0f} min", flush=True)
             torch.save(done, out)
 
         if not args.prefetch:
@@ -139,10 +193,11 @@ def main():
                 a = time.time()
                 tok, fargs = load(f)
                 b = time.time()
-                done[tok] = net(*fargs).cpu()
+                done[tok] = run(fargs)
                 c = time.time()
                 t_feat += b - a
                 t_run += c - b
+                mark(i, c)
                 report(i)
         else:
             depth = max(1, args.depth)
@@ -154,19 +209,24 @@ def main():
                     b = time.time()
                     if i + depth < len(files):
                         q.append(pool.submit(load, files[i + depth]))
-                    done[tok] = net(*fargs).cpu()
+                    done[tok] = run(fargs)
                     c = time.time()
                     t_feat += b - a
                     t_run += c - b
+                    mark(i, c)
                     report(i)
         torch.save(done, out)
         print(f"  saved {len(done)} -> {out}", flush=True)
     except BaseException:
         torch.save(done, out)
         print(f"  saved {len(done)} -> {out}", flush=True)
-        print("  device left open: closing a hung mesh aborts the process. "
-              "Run tt-smi -r before resuming.", flush=True)
-        raise
+        traceback.print_exc()
+        print("  device left open: closing a hung mesh never returns. Exiting "
+              "hard so the PCIe lock is released; run tt-smi -r before "
+              "resuming.", flush=True)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
     (ttnn.close_device if args.single else ttnn.close_mesh_device)(dev)
     return 0
 
