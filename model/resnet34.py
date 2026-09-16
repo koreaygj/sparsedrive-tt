@@ -17,6 +17,8 @@ That removes 36 ops from the graph and costs nothing in accuracy.
 from typing import Tuple
 
 import torch
+import os
+
 import ttnn
 
 LAYERS = [3, 4, 6, 3]
@@ -75,21 +77,30 @@ class Conv2dOp:
                  activation=None, shard_layout=ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
                  deallocate_activation=False, act_block_h_override=0,
                  math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=True,
-                 slice_l1=True):
+                 slice_l1=True, core_grid=None):
         self.device, self.in_channels, self.out_channels = device, in_channels, out_channels
         self.kernel_size, self.stride, self.padding = kernel_size, stride, padding
         self.batch_size, self.input_height, self.input_width = batch_size, input_height, input_width
         self.weight, self.bias = params["weight"], params["bias"]
+        if os.environ.get("TT_CONV_NO_FP32_ACC") == "1":
+            fp32_dest_acc_en = False
         self.compute_config = ttnn.init_device_compute_kernel_config(
             device.arch(), math_fidelity=math_fidelity,
             fp32_dest_acc_en=fp32_dest_acc_en, packer_l1_acc=False,
             math_approx_mode=False)
+        if os.environ.get("TT_CONV_DST_FULL_SYNC") == "1":
+            self.compute_config.dst_full_sync_en = True
         self.conv_config = ttnn.Conv2dConfig(
             weights_dtype=ttnn.bfloat16, shard_layout=shard_layout,
             deallocate_activation=deallocate_activation,
             reshard_if_not_optimal=True, activation=activation)
         if act_block_h_override:
             self.conv_config.act_block_h_override = act_block_h_override
+        if core_grid is not None:
+            self.conv_config.core_grid = ttnn.CoreRangeSet([ttnn.CoreRange(
+                ttnn.CoreCoord(0, 0),
+                ttnn.CoreCoord(core_grid[0] - 1, core_grid[1] - 1))])
+            self.conv_config.override_sharding_config = True
         self.slice_config = ttnn.Conv2dL1FullSliceConfig if slice_l1 else None
 
     def __call__(self, x):

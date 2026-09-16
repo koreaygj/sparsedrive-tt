@@ -17,6 +17,8 @@ ttnn.upsample with scale 2 matches F.interpolate(size=..., mode="nearest")
 without needing the general resize.
 """
 
+import os
+
 import ttnn
 
 from .resnet34 import Conv2dOp
@@ -36,6 +38,35 @@ def preprocess(sd: dict, prefix: str):
                 "bias": ttnn.from_torch(b.reshape(1, 1, 1, -1), dtype=ttnn.bfloat16),
             }
     return out
+
+
+def _grid(level, rows):
+    """Pin this conv to a rectangular core grid, or None to let ttnn choose.
+
+    Left to itself, reshard_if_not_optimal picked 62 cores for layer0 -- 24576
+    rows split 396/396/... over a grid that is not a rectangle, even though 64
+    divides those rows exactly into 12 tiles each. A 1D weights multicast goes
+    to a rectangle, so a 62-core set has to be covered in two sends, and every
+    hang this port has seen sat in
+    reader_writer_tiled_out_1d_mcast_receiver_conv_weights on one worker core of
+    this conv, always the same core, waiting on a credit that never came.
+
+    Pinning 8x8 keeps the multicast a single rectangle. It applies only where
+    the rows divide evenly into 32-row tiles across 64 cores; the smaller levels
+    do not, and they keep the chosen grid.
+
+    Off unless TT_FPN_GRID is set to "<x>x<y>". 8x8 was measured and did NOT
+    stop the hang, so a rectangle is not the cure; the knob stays because it
+    also picks WHICH cores run the conv, and the same worker core has come up
+    in every dump so far. It applies only where the rows divide evenly into
+    32-row tiles across that grid.
+    """
+    spec = os.environ.get("TT_FPN_GRID", "")
+    if spec:
+        x, y = (int(v) for v in spec.split("x"))
+        if rows % (x * y * 32) == 0:
+            return (x, y)
+    return None
 
 
 class TtFPN:
@@ -71,7 +102,7 @@ class TtFPN:
             self.layer.append(Conv2dOp(params[f"layer{i}"], device, OUT_CHANNELS,
                                        OUT_CHANNELS, (3, 3), (1, 1), (1, 1),
                                        batch_size, h, w, shard_layout=shard,
-                                       slice_l1=False))
+                                       slice_l1=False, core_grid=_grid(i, batch_size * h * w)))
 
     def __call__(self, feats):
         """feats: [(tensor, h, w, c)] from the backbone, highest res first."""
