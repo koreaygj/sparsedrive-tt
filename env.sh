@@ -21,12 +21,42 @@ _sd_src="${BASH_SOURCE[0]:-$0}"
 export SPARSEDRIVE_TT_ROOT="$(cd "$(dirname "$_sd_src")" && pwd)"
 unset _sd_src
 
+# --- config file --------------------------------------------------------------
+# env.yaml carries the machine-specific paths so this script does not have to
+# be edited per box. Parsed with shell on purpose: this file decides which
+# Python exists, so it cannot import a YAML library to find out. That buys a
+# flat "key: value" subset and nothing more -- no nesting, no lists.
+#
+# Precedence is environment, then env.yaml, then the built-in default, so an
+# already-exported value is never silently replaced.
+_sd_yaml="${SPARSEDRIVE_ENV_YAML:-$SPARSEDRIVE_TT_ROOT/env.yaml}"
+
+# _sd_cfg <key> <default> -> value, with ~ expanded and relative paths made
+# absolute against the repo root.
+_sd_cfg() {
+  _sd_v=""
+  if [ -f "$_sd_yaml" ]; then
+    _sd_v="$(sed -n "s/^[[:space:]]*$1[[:space:]]*:[[:space:]]*//p" "$_sd_yaml" \
+             | head -n 1 | sed 's/[[:space:]]*#.*$//; s/[[:space:]]*$//; s/^["'"'"']//; s/["'"'"']$//')"
+  fi
+  [ -n "$_sd_v" ] || _sd_v="$2"
+  case "$_sd_v" in
+    "~"|"~/"*) _sd_v="$HOME${_sd_v#\~}" ;;
+  esac
+  case "$_sd_v" in
+    /*|"") ;;
+    *) _sd_v="$SPARSEDRIVE_TT_ROOT/$_sd_v" ;;
+  esac
+  [ -d "$_sd_v" ] && _sd_v="$(cd "$_sd_v" && pwd)"
+  printf '%s' "$_sd_v"
+}
+
 # --- NAVSIM devkit ------------------------------------------------------------
 # The upstream SparseDriveV2 checkout, used by scripts/**/*.sh as
 # "$NAVSIM_DEVKIT_ROOT/navsim/planning/script/...". Set unconditionally: a stale
 # value inherited from another project's shell must not win. To point somewhere
 # else, set SPARSEDRIVE_DEVKIT_ROOT before sourcing.
-export NAVSIM_DEVKIT_ROOT="${SPARSEDRIVE_DEVKIT_ROOT:-$(dirname "$SPARSEDRIVE_TT_ROOT")/SparseDriveV2}"
+export NAVSIM_DEVKIT_ROOT="${SPARSEDRIVE_DEVKIT_ROOT:-$(_sd_cfg devkit_root "$(dirname "$SPARSEDRIVE_TT_ROOT")/SparseDriveV2")}"
 
 # --- data ---------------------------------------------------------------------
 # $SPARSEDRIVE_TT_ROOT/dataset holds symlinks into the real dataset on disk,
@@ -36,12 +66,12 @@ export NAVSIM_DEVKIT_ROOT="${SPARSEDRIVE_DEVKIT_ROOT:-$(dirname "$SPARSEDRIVE_TT
 #   dataset/sensor_blobs/<split>      <- test_sensor_blobs/<split>
 #   dataset/navhard_two_stage
 #   dataset/maps
-export OPENSCENE_DATA_ROOT="$SPARSEDRIVE_TT_ROOT/dataset"
+export OPENSCENE_DATA_ROOT="$(_sd_cfg data_root "$SPARSEDRIVE_TT_ROOT/dataset")"
 export NUPLAN_MAPS_ROOT="$OPENSCENE_DATA_ROOT/maps"
-export NUPLAN_MAP_VERSION="nuplan-maps-v1.0"
+export NUPLAN_MAP_VERSION="$(_sd_cfg map_version nuplan-maps-v1.0)"
 
 # --- experiment output (caches, logs, checkpoints written by runs) -------------
-export NAVSIM_EXP_ROOT="$SPARSEDRIVE_TT_ROOT/exp"
+export NAVSIM_EXP_ROOT="$(_sd_cfg exp_root "$SPARSEDRIVE_TT_ROOT/exp")"
 mkdir -p "$NAVSIM_EXP_ROOT"
 
 # --- tenstorrent --------------------------------------------------------------
@@ -51,13 +81,13 @@ mkdir -p "$NAVSIM_EXP_ROOT"
 # host library loads from this tree's build via RUNPATH while kernels are
 # JIT-compiled out of $TT_METAL_HOME, and a program factory expecting the
 # multi-tile grid_precompute against the old kernel hangs the device.
-_sd_want="${TT_METAL_HOME_OVERRIDE:-$HOME/project/tenstorrent/tt-metal}"
+_sd_want="${TT_METAL_HOME_OVERRIDE:-$(_sd_cfg tt_metal_home "$HOME/project/tenstorrent/tt-metal")}"
 if [ -n "$TT_METAL_HOME" ] && [ "$TT_METAL_HOME" != "$_sd_want" ]; then
   echo "  note: TT_METAL_HOME was $TT_METAL_HOME, overriding with $_sd_want"
 fi
 export TT_METAL_HOME="$_sd_want"
 unset _sd_want
-export ARCH_NAME="${ARCH_NAME:-wormhole_b0}"
+export ARCH_NAME="${ARCH_NAME:-$(_sd_cfg arch_name wormhole_b0)}"
 
 # --- interpreters -------------------------------------------------------------
 # navsim-sm120 = a clone of the `sparse` env with torch swapped to 2.8.0+cu128,
@@ -65,8 +95,8 @@ export ARCH_NAME="${ARCH_NAME:-wormhole_b0}"
 # env carries torch 2.0.1+cu117, whose fat binary stops at sm_86, so every CUDA
 # kernel died on this box's RTX 5060 Ti (sm_120). numpy stays pinned at 1.23.4
 # as navsim requires. Point NAVSIM_PY elsewhere to override.
-export NAVSIM_PY="${NAVSIM_PY:-$HOME/miniconda3/envs/navsim-sm120/bin/python}"
-export TT_PY="${TT_PY:-$HOME/.tenstorrent-venv/bin/python}"
+export NAVSIM_PY="${NAVSIM_PY:-$(_sd_cfg navsim_py "$HOME/miniconda3/envs/navsim-sm120/bin/python")}"
+export TT_PY="${TT_PY:-$(_sd_cfg tt_py "$HOME/.tenstorrent-venv/bin/python")}"
 
 # --- python path --------------------------------------------------------------
 # Our SparseDriveV2 must precede the `sparse` env's editable navsim install,
@@ -95,4 +125,5 @@ for _sd_v in SPARSEDRIVE_TT_ROOT NAVSIM_DEVKIT_ROOT OPENSCENE_DATA_ROOT NUPLAN_M
   if [ -e "$_sd_p" ]; then _sd_mark="  ok"; else _sd_mark="  MISSING"; fi
   printf '  %-20s %s%s\n' "$_sd_v" "$_sd_p" "$_sd_mark"
 done
-unset _sd_v _sd_p _sd_mark
+unset _sd_v _sd_p _sd_mark _sd_yaml
+unset -f _sd_cfg 2>/dev/null || true
