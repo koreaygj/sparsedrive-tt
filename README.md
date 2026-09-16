@@ -96,6 +96,10 @@ SPARSEDRIVE_ENV_YAML=~/other.yaml source env.sh
 `source env.sh` prints every resolved path with `ok` or `MISSING`, which is the
 quickest check that a new machine is wired up.
 
+The `tt_metal_home` it points at needs this port's kernels in it. `tt-metal/`
+holds them — eight ops to copy in and six patches to apply — with
+[tt-metal/README.md](tt-metal/README.md) covering what each one is for.
+
 ### Data
 
 `dataset/` holds symlinks into `/mnt/data2/navsim-test`, renamed the way

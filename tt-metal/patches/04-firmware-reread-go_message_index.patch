@@ -1,0 +1,20 @@
+diff --git i/tt_metal/hw/inc/internal/firmware_common.h w/tt_metal/hw/inc/internal/firmware_common.h
+index 03dae6bb42c..44eeabee9c3 100644
+--- i/tt_metal/hw/inc/internal/firmware_common.h
++++ w/tt_metal/hw/inc/internal/firmware_common.h
+@@ -198,9 +198,12 @@ void wait_for_go_message() {
+ #else
+     tt_l1_ptr mailboxes_t* const mailboxes = (tt_l1_ptr mailboxes_t*)(MEM_MAILBOX_BASE);
+ #endif
+-    uint32_t go_message_index = mailboxes->go_message_index;
+-
+-    while (mailboxes->go_messages[go_message_index].signal != RUN_MSG_GO) {
++    // Re-read the index every iteration. Latching it once races the dispatcher:
++    // a subordinate that samples the index before the dispatcher publishes the
++    // new one polls a slot that is never signalled and parks here forever, with
++    // its sync byte left at GO. BRISC and the tt-2xx DM firmware already re-read
++    // it; this is the same fix as tt-metal PR #52764, which was closed unmerged.
++    while (mailboxes->go_messages[mailboxes->go_message_index].signal != RUN_MSG_GO) {
+         invalidate_l1_cache();
+     }
+ }

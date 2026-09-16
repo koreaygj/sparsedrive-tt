@@ -1,0 +1,112 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include "grouped_weighted_sum_device_operation.hpp"
+#include "ttnn/tensor/tensor_ops.hpp"
+#include "ttnn/device_operation.hpp"
+
+namespace ttnn::prim {
+using namespace tt;
+using namespace tt::tt_metal;
+
+GroupedWeightedSumOperation::program_factory_t GroupedWeightedSumOperation::select_program_factory(
+    const operation_attributes_t&, const tensor_args_t&) {
+    return GroupedWeightedSumProgramFactory{};
+}
+
+void GroupedWeightedSumOperation::validate_on_program_cache_miss(
+    const operation_attributes_t& attrs, const tensor_args_t& t) {
+    if (t.perm.has_value()) {
+        TT_FATAL(attrs.clp_per_cam > 0, "skip mode needs clp_per_cam");
+        TT_FATAL(t.live.has_value(), "skip mode needs the live bitmap");
+        TT_FATAL(t.mbox.has_value(), "skip mode needs the L1 mailbox tensor");
+        TT_FATAL(t.features.layout() == Layout::ROW_MAJOR, "skip mode is RM-only");
+        TT_FATAL(t.perm->dtype() == DataType::UINT32 && t.perm->layout() == Layout::ROW_MAJOR,
+                 "perm must be uint32 ROW_MAJOR");
+        TT_FATAL(t.live->dtype() == DataType::UINT32 && t.live->layout() == Layout::ROW_MAJOR,
+                 "live must be uint32 ROW_MAJOR");
+    }
+
+    TT_FATAL(t.features.storage_type() == StorageType::DEVICE, "features must be on device");
+    TT_FATAL(t.weights.storage_type() == StorageType::DEVICE, "weights must be on device");
+    TT_FATAL(t.features.layout() == Layout::TILE || t.features.layout() == Layout::ROW_MAJOR,
+             "features must be TILE or ROW_MAJOR");
+    TT_FATAL(t.weights.layout() == Layout::TILE, "weights must be TILE");
+    TT_FATAL(t.features.logical_shape().rank() == 3, "features must be 3D [clp, N, E]");
+    TT_FATAL(t.features.logical_shape()[-1] == attrs.num_groups * attrs.group_dims, "E must be G*D");
+    TT_FATAL(attrs.group_dims == 32, "group_dims must be 32 (== TILE_WIDTH) in current implementation");
+
+    const uint32_t clp = t.features.logical_shape()[0];
+    const uint32_t anchors = t.features.logical_shape()[1];
+    // The reduction is cut into num_chunks pieces of ceil(clp/num_chunks), and
+    // outside skip mode the compute kernel runs exactly that many iterations
+    // for EVERY work unit -- including the short last one. When the division is
+    // ragged the reader sends the last chunk fewer pages than compute waits
+    // for, and the op hangs the device with no error. Refuse it here instead.
+    TT_FATAL(clp % attrs.num_chunks == 0,
+             "num_chunks must divide the reduction exactly: clp {} % num_chunks {} = {}",
+             clp, attrs.num_chunks, clp % attrs.num_chunks);
+    const auto& w = t.weights.logical_shape();
+    // Two accepted weight layouts, told apart by the last dimension. COMPACT [N, clp*G]
+    // fills every column of a tile; the 3D [clp, N, G] leaves 24 of 32 as padding, which
+    // is 4x the tensor and 4x the reader's DRAM traffic for the same numbers.
+    if (w[-1] == attrs.num_groups * clp) {
+        TT_FATAL(w[-2] == anchors, "compact weights must be [N, clp*G]; got N={}", w[-2]);
+        TT_FATAL((attrs.num_groups * clp) % 32 == 0,
+                 "compact weights need clp*G to be a multiple of the tile width; got {}",
+                 attrs.num_groups * clp);
+    } else {
+        TT_FATAL(w.rank() == 3, "weights must be 3D [clp, N, G] or compact [N, clp*G]");
+        TT_FATAL(w[-1] == attrs.num_groups, "last dim must be num_groups");
+        TT_FATAL(w[0] == clp, "clp must match");
+        TT_FATAL(w[1] == anchors, "N must match");
+    }
+}
+
+TensorSpec GroupedWeightedSumOperation::compute_output_specs(
+    const operation_attributes_t& attrs, const tensor_args_t& t) {
+    const uint32_t output_n = t.features.logical_shape()[1];  // N (output anchors)
+    const uint32_t embed_dims = attrs.num_groups * attrs.group_dims;
+    // Output: [num_chunks * output_n_padded, embed_dims] TILE — one block per
+    // partial sum, which the caller adds together.
+    const uint32_t num_chunks = attrs.num_chunks;
+    const uint32_t output_n_padded = ((output_n + 31) / 32) * 32;
+    const ttnn::Shape output_shape({num_chunks * output_n_padded, embed_dims});
+    return TensorSpec(
+        output_shape,
+        TensorLayout::fromPaddedShape(
+            DataType::BFLOAT16,
+            PageConfig(Layout::TILE),
+            attrs.output_mem_config,
+            output_shape, output_shape));
+}
+
+Tensor GroupedWeightedSumOperation::create_output_tensors(
+    const operation_attributes_t& attrs, const tensor_args_t& t) {
+    return create_device_tensor(compute_output_specs(attrs, t), t.features.device());
+}
+
+Tensor grouped_weighted_sum(
+    const Tensor& features, const Tensor& weights,
+    uint32_t num_groups, uint32_t group_dims,
+    const std::optional<MemoryConfig>& memory_config,
+    const std::optional<Tensor>& perm,
+    const std::optional<Tensor>& live,
+    uint32_t clp_per_cam,
+    const std::optional<Tensor>& mbox,
+    uint32_t num_chunks) {
+    using Op = GroupedWeightedSumOperation;
+    TT_FATAL(num_chunks >= 1, "num_chunks must be at least 1");
+    return ttnn::device_operation::launch<Op>(
+        Op::operation_attributes_t{
+            .num_groups = num_groups, .group_dims = group_dims,
+            .clp_per_cam = perm.has_value() ? clp_per_cam : 0u,
+            .num_chunks = num_chunks,
+            .output_mem_config = memory_config.value_or(features.memory_config()),
+        },
+        Op::tensor_args_t{.features = features, .weights = weights,
+                          .perm = perm, .live = live, .mbox = mbox});
+}
+
+}  // namespace ttnn::prim

@@ -1,0 +1,22 @@
+diff --git i/tt_metal/core_descriptors/wormhole_b0_80_arch_eth_dispatch.yaml w/tt_metal/core_descriptors/wormhole_b0_80_arch_eth_dispatch.yaml
+index aba5afeace2..dfc48ea358e 100644
+--- i/tt_metal/core_descriptors/wormhole_b0_80_arch_eth_dispatch.yaml
++++ w/tt_metal/core_descriptors/wormhole_b0_80_arch_eth_dispatch.yaml
+@@ -62,7 +62,7 @@ nebula_x2:
+     1:
+       compute_with_storage_grid_range: # Logical only start and end [x, y]
+         start: [0, 0]
+-        end: [7, 7]
++        end: [7, 6]
+ 
+ 
+       dispatch_cores:
+@@ -74,7 +74,7 @@ nebula_x2:
+     2:
+       compute_with_storage_grid_range: # Logical only start and end [x, y]
+         start: [0, 0]
+-        end: [7, 7]
++        end: [7, 6]
+ 
+ 
+       dispatch_cores:

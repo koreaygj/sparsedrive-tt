@@ -1,0 +1,17 @@
+diff --git i/ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_op_sharded_program_factory.cpp w/ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_op_sharded_program_factory.cpp
+index dc190722d3a..bc0cc1d3cc6 100644
+--- i/ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_op_sharded_program_factory.cpp
++++ w/ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_op_sharded_program_factory.cpp
+@@ -1181,6 +1181,12 @@ tt::tt_metal::ProgramDescriptor build_program_descriptor_sharded(
+     compute_kernel_desc.config = ComputeConfigDescriptor{
+         .math_fidelity = math_fidelity,
+         .fp32_dest_acc_en = fp32_dest_acc_en,
++        // dst_full_sync_en was unpacked from the compute config and then
++        // dropped, so DstSync stayed SyncHalf no matter what the caller asked
++        // for. The half-bank ping-pong is where this port's hang parks -- pack
++        // in flip_packer_dest_offset_id, math in clear_dst_reg_addr -- so the
++        // flag has to reach the kernel for that to be testable at all.
++        .dst_full_sync_en = dst_full_sync_en,
+     };
+ 
+     // Helper lambda to setup mcast arguments

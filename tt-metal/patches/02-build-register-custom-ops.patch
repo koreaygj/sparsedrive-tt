@@ -1,0 +1,108 @@
+diff --git i/ttnn/cpp/ttnn-nanobind/__init__.cpp w/ttnn/cpp/ttnn-nanobind/__init__.cpp
+index 0e1f4d35d1a..61108b9ff93 100644
+--- i/ttnn/cpp/ttnn-nanobind/__init__.cpp
++++ w/ttnn/cpp/ttnn-nanobind/__init__.cpp
+@@ -71,6 +71,14 @@
+ #include "ttnn/operations/pool/rotate/rotate_nanobind.hpp"
+ #include "ttnn/operations/pool/upsample/upsample_nanobind.hpp"
+ #include "ttnn/operations/pool/grid_sample/grid_sample_nanobind.hpp"
++#include "ttnn/operations/pool/grid_compact/grid_compact_nanobind.hpp"
++#include "ttnn/operations/pool/grid_precompute/grid_precompute_nanobind.hpp"
++#include "ttnn/operations/pool/topk_select/topk_select_nanobind.hpp"
++#include "ttnn/operations/pool/row_gather/row_gather_nanobind.hpp"
++#include "ttnn/operations/pool/anchor_bucket/anchor_bucket_nanobind.hpp"
++#include "ttnn/operations/pool/kps_project_fused/kps_project_fused_nanobind.hpp"
++#include "ttnn/operations/pool/grouped_weighted_sum/grouped_weighted_sum_nanobind.hpp"
++#include "ttnn/operations/pool/transposed_s2i/transposed_s2i_nanobind.hpp"
+ #include "ttnn/operations/prefetcher/prefetcher_nanobind.hpp"
+ #include "ttnn/operations/reduction/reduction_nanobind.hpp"
+ #include "ttnn/operations/sliding_window/sliding_window_nanobind.hpp"
+@@ -167,6 +175,14 @@ void py_module(nb::module_& mod) {
+     rotate::py_module(m_pool);
+     upsample::py_module(m_pool);
+     grid_sample::bind_grid_sample(m_pool);
++    grid_compact::bind_grid_compact(m_pool);
++    grid_precompute::bind_grid_precompute(m_pool);
++    topk_select::bind_topk_select(m_pool);
++    row_gather::bind_row_gather(m_pool);
++    anchor_bucket::bind_anchor_bucket(m_pool);
++    kps_project_fused::bind_kps_project_fused(m_pool);
++    grouped_weighted_sum::bind_grouped_weighted_sum(m_pool);
++    transposed_s2i::bind_transposed_s2i(m_pool);
+ 
+     auto m_normalization = mod.def_submodule("normalization", "normalization operations");
+     normalization::py_module(m_normalization);
+diff --git i/ttnn/cpp/ttnn/operations/pool/CMakeLists.txt w/ttnn/cpp/ttnn/operations/pool/CMakeLists.txt
+index 8f409171859..0a0f6003e61 100644
+--- i/ttnn/cpp/ttnn/operations/pool/CMakeLists.txt
++++ w/ttnn/cpp/ttnn/operations/pool/CMakeLists.txt
+@@ -19,6 +19,14 @@ file(
+     device/kernels/*
+     generic/device/kernels/*
+     grid_sample/device/kernels/*
++    grid_precompute/device/kernels/*
++    topk_select/device/kernels/*
++    row_gather/device/kernels/*
++    anchor_bucket/device/kernels/*
++    grid_compact/device/kernels/*
++    kps_project_fused/device/kernels/*
++    grouped_weighted_sum/device/kernels/*
++    transposed_s2i/device/kernels/*
+     rotate/device/kernels/*
+     upsample/device/kernels/*
+ )
+diff --git i/ttnn/cpp/ttnn/operations/pool/sources.cmake w/ttnn/cpp/ttnn/operations/pool/sources.cmake
+index 36eb08669f2..d0ac16a5b65 100644
+--- i/ttnn/cpp/ttnn/operations/pool/sources.cmake
++++ w/ttnn/cpp/ttnn/operations/pool/sources.cmake
+@@ -19,6 +19,31 @@ set(TTNN_OP_POOL_SRCS
+     grid_sample/device/grid_sample_utils.cpp
+     grid_sample/grid_sample.cpp
+     grid_sample/grid_sample_prepare_grid.cpp
++    grid_precompute/grid_precompute.cpp
++    grid_precompute/device/grid_precompute_device_operation.cpp
++    grid_precompute/device/grid_precompute_program_factory.cpp
++    topk_select/topk_select.cpp
++    row_gather/row_gather.cpp
++    anchor_bucket/anchor_bucket.cpp
++    anchor_bucket/device/anchor_bucket_device_operation.cpp
++    anchor_bucket/device/anchor_bucket_program_factory.cpp
++    row_gather/device/row_gather_device_operation.cpp
++    row_gather/device/row_gather_program_factory.cpp
++    topk_select/device/topk_select_device_operation.cpp
++    topk_select/device/topk_select_program_factory.cpp
++    grid_compact/grid_compact.cpp
++    grid_compact/device/grid_compact_device_operation.cpp
++    grid_compact/device/grid_compact_program_factory.cpp
++    kps_project_fused/kps_project_fused.cpp
++    kps_project_fused/device/kps_project_fused_device_operation.cpp
++    kps_project_fused/device/kps_project_fused_program_factory.cpp
++    kps_project_fused/device/kps_project_fused_tile_program_factory.cpp
++    grouped_weighted_sum/grouped_weighted_sum.cpp
++    grouped_weighted_sum/device/grouped_weighted_sum_device_operation.cpp
++    grouped_weighted_sum/device/grouped_weighted_sum_program_factory.cpp
++    transposed_s2i/transposed_s2i.cpp
++    transposed_s2i/device/transposed_s2i_device_operation.cpp
++    transposed_s2i/device/transposed_s2i_program_factory.cpp
+     rotate/device/rotate_device_operation.cpp
+     rotate/device/rotate_nearest_program_factory.cpp
+     rotate/device/rotate_bilinear_program_factory.cpp
+diff --git i/ttnn/sources.cmake w/ttnn/sources.cmake
+index ba14e7dde9f..35ec2aee859 100644
+--- i/ttnn/sources.cmake
++++ w/ttnn/sources.cmake
+@@ -315,6 +315,14 @@ set(TTNN_SRC_PYBIND
+     cpp/ttnn/operations/normalization/softmax/softmax_nanobind.cpp
+     cpp/ttnn/operations/pool/generic/generic_pools_nanobind.cpp
+     cpp/ttnn/operations/pool/grid_sample/grid_sample_nanobind.cpp
++    cpp/ttnn/operations/pool/grid_precompute/grid_precompute_nanobind.cpp
++    cpp/ttnn/operations/pool/topk_select/topk_select_nanobind.cpp
++    cpp/ttnn/operations/pool/row_gather/row_gather_nanobind.cpp
++    cpp/ttnn/operations/pool/anchor_bucket/anchor_bucket_nanobind.cpp
++    cpp/ttnn/operations/pool/grid_compact/grid_compact_nanobind.cpp
++    cpp/ttnn/operations/pool/kps_project_fused/kps_project_fused_nanobind.cpp
++    cpp/ttnn/operations/pool/grouped_weighted_sum/grouped_weighted_sum_nanobind.cpp
++    cpp/ttnn/operations/pool/transposed_s2i/transposed_s2i_nanobind.cpp
+     cpp/ttnn/operations/pool/rotate/rotate_nanobind.cpp
+     cpp/ttnn/operations/pool/upsample/upsample_nanobind.cpp
+     cpp/ttnn/operations/prefetcher/prefetcher/dram_prefetcher_nanobind.cpp

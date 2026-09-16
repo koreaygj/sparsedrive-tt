@@ -1,0 +1,38 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+#include "ttnn/device_operation.hpp"
+#include "grouped_weighted_sum_device_operation_types.hpp"
+
+namespace ttnn::prim {
+
+struct GroupedWeightedSumProgramFactory {
+    struct shared_variables_t {
+        tt::tt_metal::KernelHandle reader_kernel_id;
+        tt::tt_metal::KernelHandle writer_kernel_id;
+        tt::tt_metal::KernelHandle compute_kernel_id;
+        // Launch nonce for the skip-mode mailbox: tags must never repeat
+        // across launches or a cached-program re-run matches last frame's
+        // stale tag before the reader writes this frame's count.
+        uint32_t launch_seq;
+        uint32_t num_cores;
+        std::vector<tt::tt_metal::CoreCoord> logical_cores;
+    };
+
+    using cached_program_t = ttnn::device_operation::CachedProgram<shared_variables_t>;
+
+    static cached_program_t create(
+        const GroupedWeightedSumParams& params,
+        const GroupedWeightedSumInputs& inputs,
+        tt::tt_metal::Tensor& output);
+
+    static void override_runtime_arguments(
+        cached_program_t& cached_program,
+        const GroupedWeightedSumParams& params,
+        const GroupedWeightedSumInputs& inputs,
+        tt::tt_metal::Tensor& output);
+};
+
+}  // namespace ttnn::prim

@@ -1,0 +1,403 @@
+diff --git i/ttnn/cpp/ttnn/operations/pool/grid_sample/device/grid_sample_bilinear_program_factory.cpp w/ttnn/cpp/ttnn/operations/pool/grid_sample/device/grid_sample_bilinear_program_factory.cpp
+index 920c8ccd814..4f5030a9ffa 100644
+--- i/ttnn/cpp/ttnn/operations/pool/grid_sample/device/grid_sample_bilinear_program_factory.cpp
++++ w/ttnn/cpp/ttnn/operations/pool/grid_sample/device/grid_sample_bilinear_program_factory.cpp
+@@ -110,6 +110,27 @@ ProgramDescriptor GridSampleBilinearProgramFactory::create_descriptor(
+         .buffer = is_sharded ? grid_tensor.buffer() : nullptr,
+     });
+ 
++    // Per-stick source batch, if the caller supplied one. Same shard height as the grid,
++    // so a core's slice lines up index-for-index with the grid sticks it owns.
++    const auto& batch_index_tensor = tensor_args.batch_index;
++    const bool use_batch_index = batch_index_tensor.has_value();
++    uint32_t batch_index_cb_index = 0;
++    if (use_batch_index) {
++        const uint32_t bidx_stick_size =
++            batch_index_tensor->padded_shape()[-1] * batch_index_tensor->element_size();
++        batch_index_cb_index = cb_idx++;
++        desc.cbs.push_back(CBDescriptor{
++            .total_size = grid_nsticks_per_core * bidx_stick_size,
++            .core_ranges = all_cores,
++            .format_descriptors = {{CBFormatDescriptor{
++                .buffer_index = static_cast<uint8_t>(batch_index_cb_index),
++                .data_format = tt::DataFormat::UInt32,
++                .page_size = bidx_stick_size,
++            }}},
++            .buffer = batch_index_tensor->buffer(),
++        });
++    }
++
+     // Resolve compute kernel config early: under fp32_dest_acc_en + half-sync, DEST holds only 4
+     // fp32 tiles, so each chunk must shrink to <= 4 tiles. When the user explicitly enables
+     // dst_full_sync_en, full-sync DEST holds 8 fp32 tiles and the 4-tile clamp would be a
+@@ -250,6 +271,17 @@ ProgramDescriptor GridSampleBilinearProgramFactory::create_descriptor(
+     if (!is_sharded) {
+         tt::tt_metal::TensorAccessorArgs(*grid_tensor.buffer()).append_to(reader_compile_time_args);
+     }
++    if (is_sharded) {
++        // After the accessor, so ct_arg[19] stays the accessor base the reader hardcodes.
++        reader_compile_time_args.push_back(use_batch_index ? 1U : 0U);
++        reader_compile_time_args.push_back(batch_index_cb_index);
++        reader_compile_time_args.push_back(
++            use_batch_index ? static_cast<uint32_t>(batch_index_tensor->padded_shape()[-1]) : 1U);
++        // The GRID's batch, which is not the input's once batch_index is in play: a pooled
++        // grid is one batch of sticks that each name their own source image. The reader
++        // needs it to know where the real sticks end and height-sharding padding begins.
++        reader_compile_time_args.push_back(grid_shape[0]);
++    }
+ 
+     const std::string reader_kernel_path =
+         is_sharded ? "ttnn/cpp/ttnn/operations/pool/grid_sample/device/kernels/dataflow/reader_grid_sample_sharded.cpp"
+diff --git i/ttnn/cpp/ttnn/operations/pool/grid_sample/device/grid_sample_device_operation.cpp w/ttnn/cpp/ttnn/operations/pool/grid_sample/device/grid_sample_device_operation.cpp
+index 132e250f67b..ecfc43fd9bd 100644
+--- i/ttnn/cpp/ttnn/operations/pool/grid_sample/device/grid_sample_device_operation.cpp
++++ w/ttnn/cpp/ttnn/operations/pool/grid_sample/device/grid_sample_device_operation.cpp
+@@ -66,13 +66,26 @@ void GridSampleOperation::validate_on_program_cache_miss(
+             grid_tensor.logical_shape());
+     }
+ 
+-    TT_FATAL(
++    if (tensor_args.batch_index.has_value()) {
++        const auto& bidx = *tensor_args.batch_index;
++        TT_FATAL(bidx.dtype() == DataType::UINT32, "batch_index must be UINT32");
++        TT_FATAL(bidx.layout() == Layout::ROW_MAJOR, "batch_index must be ROW_MAJOR");
++        TT_FATAL(bidx.is_sharded(), "batch_index must be L1 sharded, like the grid it indexes");
++        TT_FATAL(grid_tensor.is_sharded(), "batch_index is only supported with a sharded grid");
++        TT_FATAL(
++            bidx.shard_spec()->shape[0] == grid_tensor.shard_spec()->shape[0],
++            "batch_index must have the same shard height as the grid ({} vs {})",
++            bidx.shard_spec()->shape[0],
++            grid_tensor.shard_spec()->shape[0]);
++    } else {
++        TT_FATAL(
+         input_tensor.logical_shape()[0] == grid_tensor.logical_shape()[0],
+         "Batch size mismatch: input tensor shape {} has batch size {}, but grid tensor shape {} has batch size {}",
+         input_tensor.logical_shape(),
+         input_tensor.logical_shape()[0],
+         grid_tensor.logical_shape(),
+         grid_tensor.logical_shape()[0]);
++    }
+ 
+     // batch_output_channels validation - must have batched input (K > 1)
+     if (operation_attributes.batch_output_channels) {
+@@ -96,8 +109,9 @@ void GridSampleOperation::validate_on_program_cache_miss(
+         TT_FATAL(grid_tensor.dtype() == DataType::BFLOAT16, "Precomputed grid tensor must be BFLOAT16");
+     } else {
+         TT_FATAL(
+-            grid_tensor.dtype() == DataType::BFLOAT16 || grid_tensor.dtype() == DataType::FLOAT32,
+-            "Grid tensor must be BFLOAT16 or FLOAT32");
++            grid_tensor.dtype() == DataType::BFLOAT16 || grid_tensor.dtype() == DataType::FLOAT32 ||
++                grid_tensor.dtype() == DataType::UINT16,
++            "Grid tensor must be BFLOAT16, FLOAT32, or UINT16 (Q14 fixed point)");
+     }
+ 
+     // Layout validation
+@@ -151,8 +165,10 @@ TensorSpec GridSampleOperation::compute_output_specs(
+     const auto& input_shape = input_tensor.logical_shape();
+     const auto& grid_shape = grid_tensor.logical_shape();
+ 
+-    // Extract dimensions
+-    uint32_t N = input_shape[0];
++    // Extract dimensions. With a batch_index the grid is a single pooled list whose
++    // sticks each name their own source batch, so the output has ONE batch of grid_shape[1]
++    // rows rather than one block per input batch.
++    uint32_t N = tensor_args.batch_index.has_value() ? grid_shape[0] : input_shape[0];
+     uint32_t C = input_shape[-1];
+     uint32_t H_out = grid_shape[1];
+     uint32_t W_out = grid_shape[2];
+@@ -310,7 +326,8 @@ ttnn::Tensor grid_sample(
+     bool use_precomputed_grid,
+     bool batch_output_channels,
+     const std::optional<MemoryConfig>& memory_config,
+-    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config) {
++    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config,
++    const std::optional<Tensor>& batch_index) {
+     using OperationType = GridSampleOperation;
+     const auto resolved_compute_kernel_config = ttnn::init_device_compute_kernel_config(
+         input_tensor.device()->arch(),
+@@ -329,7 +346,8 @@ ttnn::Tensor grid_sample(
+             .output_mem_config = memory_config.value_or(grid.memory_config()),
+             .compute_kernel_config = resolved_compute_kernel_config,
+         },
+-        OperationType::tensor_args_t{.input_tensor = input_tensor, .grid = grid});
++        OperationType::tensor_args_t{
++            .input_tensor = input_tensor, .grid = grid, .batch_index = batch_index});
+ }
+ 
+ }  // namespace ttnn::prim
+diff --git i/ttnn/cpp/ttnn/operations/pool/grid_sample/device/grid_sample_device_operation.hpp w/ttnn/cpp/ttnn/operations/pool/grid_sample/device/grid_sample_device_operation.hpp
+index 6a9618cbaf1..93e1e057bea 100644
+--- i/ttnn/cpp/ttnn/operations/pool/grid_sample/device/grid_sample_device_operation.hpp
++++ w/ttnn/cpp/ttnn/operations/pool/grid_sample/device/grid_sample_device_operation.hpp
+@@ -55,5 +55,6 @@ ttnn::Tensor grid_sample(
+     bool use_precomputed_grid = false,
+     bool batch_output_channels = false,
+     const std::optional<MemoryConfig>& memory_config = std::nullopt,
+-    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config = std::nullopt);
++    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config = std::nullopt,
++    const std::optional<Tensor>& batch_index = std::nullopt);
+ }  // namespace ttnn::prim
+diff --git i/ttnn/cpp/ttnn/operations/pool/grid_sample/device/grid_sample_device_operation_types.hpp w/ttnn/cpp/ttnn/operations/pool/grid_sample/device/grid_sample_device_operation_types.hpp
+index efe61f0109a..771f9dd8d4f 100644
+--- i/ttnn/cpp/ttnn/operations/pool/grid_sample/device/grid_sample_device_operation_types.hpp
++++ w/ttnn/cpp/ttnn/operations/pool/grid_sample/device/grid_sample_device_operation_types.hpp
+@@ -41,6 +41,12 @@ struct GridSampleParams {
+ struct GridSampleInputs {
+     Tensor input_tensor;
+     Tensor grid;
++    // Optional per-grid-stick source batch. Without it the reader derives the batch
++    // positionally — stick i belongs to batch i / grid_hw — which forces a caller that
++    // compacts its grid to keep one fixed-size block per batch, sized for the busiest
++    // one. With it the grid can be a single pooled list in any order.
++    // L1 height-sharded UINT32, same shard height as the grid, one row per grid stick.
++    std::optional<Tensor> batch_index;
+ };
+ 
+ }  // namespace ttnn::prim
+diff --git i/ttnn/cpp/ttnn/operations/pool/grid_sample/device/kernels/dataflow/reader_grid_sample_interleaved_start_id.cpp w/ttnn/cpp/ttnn/operations/pool/grid_sample/device/kernels/dataflow/reader_grid_sample_interleaved_start_id.cpp
+index a94e54a9a48..b5c181e0b28 100644
+--- i/ttnn/cpp/ttnn/operations/pool/grid_sample/device/kernels/dataflow/reader_grid_sample_interleaved_start_id.cpp
++++ w/ttnn/cpp/ttnn/operations/pool/grid_sample/device/kernels/dataflow/reader_grid_sample_interleaved_start_id.cpp
+@@ -91,7 +91,7 @@ void kernel_main() {
+                 input_chunk_nbytes,
+                 last_chunk_partial,
+                 input_cb_index,
+-                scalar_cb_index>(noc, input_cb, scalar_cb, grid_ptr, grid_idx, input_tensor_accessor, batch_offset);
++                scalar_cb_index>(noc, input_cb, scalar_cb, grid_ptr, grid_idx, grid_batches, input_tensor_accessor, batch_offset);
+         }
+ 
+         // Update batch tracking (avoid division in loop)
+diff --git i/ttnn/cpp/ttnn/operations/pool/grid_sample/device/kernels/dataflow/reader_grid_sample_sharded.cpp w/ttnn/cpp/ttnn/operations/pool/grid_sample/device/kernels/dataflow/reader_grid_sample_sharded.cpp
+index 4e70d97af37..b1fb14951a5 100644
+--- i/ttnn/cpp/ttnn/operations/pool/grid_sample/device/kernels/dataflow/reader_grid_sample_sharded.cpp
++++ w/ttnn/cpp/ttnn/operations/pool/grid_sample/device/kernels/dataflow/reader_grid_sample_sharded.cpp
+@@ -89,6 +89,22 @@ void kernel_main() {
+     constexpr auto input_tensor_args = TensorAccessorArgs<19>();
+     const auto input_tensor_accessor = TensorAccessor(input_tensor_args, input_addr);
+ 
++    // Optional per-stick source batch. Positional batch tracking forces the caller to lay
++    // the grid out as one fixed-size block per batch; with this the grid can be a single
++    // pooled list, which is what makes compacting it worthwhile.
++    constexpr uint32_t BIDX_OFFSET = input_tensor_args.next_compile_time_args_offset();
++    constexpr uint32_t use_batch_index = get_compile_time_arg_val(BIDX_OFFSET);
++    constexpr uint32_t batch_index_cb_index = get_compile_time_arg_val(BIDX_OFFSET + 1);
++    constexpr uint32_t batch_index_stride = get_compile_time_arg_val(BIDX_OFFSET + 2);
++    constexpr uint32_t grid_batch = get_compile_time_arg_val(BIDX_OFFSET + 3);
++
++    volatile tt_l1_ptr uint32_t* batch_index_ptr = nullptr;
++    if constexpr (use_batch_index) {
++        experimental::CB batch_index_cb(batch_index_cb_index);
++        batch_index_ptr =
++            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(batch_index_cb.get_read_ptr());
++    }
++
+     // Calculate starting batch from global grid stick position
+     // All grid points in one grid stick are in the same batch
+     const uint32_t starting_batch = global_grid_stick_start / grid_hw;
+@@ -105,7 +121,11 @@ void kernel_main() {
+ 
+     // Clamp this core's stick count to exclude height-sharding padding.
+     // Padding sticks contain garbage that would produce invalid NOC addresses.
+-    constexpr uint32_t total_valid_sticks = input_batch * grid_hw;  // logical grid sticks across all batches
++    // Grid batch, not input batch: with a pooled grid the two differ (one batch of sticks
++    // against N input images), and using input_batch here made the reader treat the
++    // height-sharding padding sticks as real — garbage coordinates and, worse, a garbage
++    // batch index turned into a NOC address.
++    constexpr uint32_t total_valid_sticks = grid_batch * grid_hw;
+     const uint32_t remaining =  // valid sticks from this core's start to end of grid
+         (global_grid_stick_start < total_valid_sticks) ? (total_valid_sticks - global_grid_stick_start) : 0;
+     const uint32_t valid_sticks_this_core =  // min(assigned, remaining) — actual work for this core
+@@ -142,7 +162,13 @@ void kernel_main() {
+             volatile tt_l1_ptr uint16_t* const grid_stick_ptr =
+                 reinterpret_cast<volatile tt_l1_ptr uint16_t*>(l1_grid_addr);
+ 
+-            uint32_t batch_offset = curr_batch * input_height * input_width;
++            uint32_t batch_offset;
++            if constexpr (use_batch_index) {
++                batch_offset =
++                    batch_index_ptr[grid_stick_idx * batch_index_stride] * input_height * input_width;
++            } else {
++                batch_offset = curr_batch * input_height * input_width;
++            }
+             process_grid_point<
+                 grid_dtype,
+                 use_precomputed_grid,
+@@ -155,7 +181,7 @@ void kernel_main() {
+                 last_chunk_partial,
+                 input_cb_index,
+                 scalar_cb_index>(
+-                noc, input_cb, scalar_cb, grid_stick_ptr, in_grid_row_idx, input_tensor_accessor, batch_offset);
++                noc, input_cb, scalar_cb, grid_stick_ptr, in_grid_row_idx, grid_batching_factor, input_tensor_accessor, batch_offset);
+         } else {
+             // Padding stick from height-sharding — push zero-weight data to CBs
+             // so the compute kernel receives the expected number of items.
+diff --git i/ttnn/cpp/ttnn/operations/pool/grid_sample/device/kernels/grid_sample_reader_common.hpp w/ttnn/cpp/ttnn/operations/pool/grid_sample/device/kernels/grid_sample_reader_common.hpp
+index ecdaa85e72c..fc4808bf85c 100644
+--- i/ttnn/cpp/ttnn/operations/pool/grid_sample/device/kernels/grid_sample_reader_common.hpp
++++ w/ttnn/cpp/ttnn/operations/pool/grid_sample/device/kernels/grid_sample_reader_common.hpp
+@@ -20,6 +20,15 @@ constexpr uint32_t STANDARD_GRID_ELEMENTS_PER_POINT = 2;
+ // Data type constants (from ttnn/api/ttnn/tensor/types.hpp DataType enum)
+ constexpr uint32_t DTYPE_BFLOAT16 = 0;
+ constexpr uint32_t DTYPE_FLOAT32 = 1;
++// UINT16 is a CONTAINER for a Q14 fixed-point coordinate, not an unsigned value. The
++// coordinate is clamped to [-2, 2], so a float's exponent bits buy nothing while the
++// bilinear weight it feeds is the coordinate's fractional part and wants uniform
++// absolute precision. Measured relative error in the sampled value: bf16 3.8e-2,
++// Q14 8.6e-4, against 1.0e-3 from the feature map's own bf16 storage.
++// The shift is shared with kps_project_fused (which writes it) and grid_compact.
++constexpr uint32_t DTYPE_UINT16 = 6;
++constexpr int32_t GRID_FIXED_SHIFT = 14;
++constexpr float GRID_FIXED_INV = 1.0f / (float)(1 << GRID_FIXED_SHIFT);
+ 
+ // Utility functions
+ ALWI bool is_coordinate_valid(int32_t coord, uint32_t max_size) {
+@@ -40,6 +49,7 @@ struct GridCoordinateReader {
+     ALWI static void read_grid_point(
+         GridPtrType grid_ptr,
+         uint32_t grid_idx,
++        uint32_t grid_k,
+         float height_scale,
+         float height_offset,
+         float width_scale,
+@@ -55,21 +65,28 @@ struct GridCoordinateReader {
+         uint16_t& weight_sw_bf,
+         uint16_t& weight_se_bf) {
+         if constexpr (use_precomputed_grid) {
+-            // Each precomputed grid entry has 6 values: h0, w0, weight_nw, weight_ne, weight_sw, weight_se
+-            const uint32_t precomputed_data_offset = grid_idx * PRECOMPUTED_GRID_ELEMENTS_PER_POINT;
+-            const int16_t h0_raw = *reinterpret_cast<volatile int16_t*>(&grid_ptr[precomputed_data_offset + 0]);
+-            const int16_t w0_raw = *reinterpret_cast<volatile int16_t*>(&grid_ptr[precomputed_data_offset + 1]);
++            // FIELD-MAJOR within the stick: [h0 x K][w0 x K][nw x K][ne x K][sw x K][se x K],
++            // K being the grid batching factor. Grouping by field rather than by point lets
++            // the producer (grid_precompute's writer) emit each field as one contiguous run
++            // instead of interleaving two source tiles two bytes at a time — the interleaved
++            // form cost that writer ~40 instructions per value. This reader does the same
++            // six loads either way; only the offsets differ.
++            //
++            // NOTE this diverges from upstream's interleaved layout, and from what the host
++            // prepare_grid_sample_grid emits. In this repo the only producer of precomputed
++            // grids is ttnn.grid_precompute, which emits this layout.
++            const int16_t h0_raw = *reinterpret_cast<volatile int16_t*>(&grid_ptr[grid_idx]);
++            const int16_t w0_raw = *reinterpret_cast<volatile int16_t*>(&grid_ptr[grid_k + grid_idx]);
+ 
+             h0 = static_cast<int32_t>(h0_raw);
+             w0 = static_cast<int32_t>(w0_raw);
+             h1 = h0 + 1;
+             w1 = w0 + 1;
+ 
+-            // Read precomputed weights
+-            weight_nw_bf = grid_ptr[precomputed_data_offset + 2];
+-            weight_ne_bf = grid_ptr[precomputed_data_offset + 3];
+-            weight_sw_bf = grid_ptr[precomputed_data_offset + 4];
+-            weight_se_bf = grid_ptr[precomputed_data_offset + 5];
++            weight_nw_bf = grid_ptr[2 * grid_k + grid_idx];
++            weight_ne_bf = grid_ptr[3 * grid_k + grid_idx];
++            weight_sw_bf = grid_ptr[4 * grid_k + grid_idx];
++            weight_se_bf = grid_ptr[5 * grid_k + grid_idx];
+         } else {
+             // Each regular grid entry has 2 values: x, y coordinates
+             float h_coord_rel, w_coord_rel;
+@@ -79,6 +96,13 @@ struct GridCoordinateReader {
+                 const uint32_t float_offset = grid_idx * STANDARD_GRID_ELEMENTS_PER_POINT;
+                 w_coord_rel = float_data[float_offset + 0];  // x coordinate
+                 h_coord_rel = float_data[float_offset + 1];  // y coordinate
++            } else if constexpr (grid_dtype == DTYPE_UINT16) {
++                // Q14 fixed point: reinterpret the 16 bits as signed and scale.
++                const uint32_t coordinate_pair_offset = grid_idx * STANDARD_GRID_ELEMENTS_PER_POINT;
++                const uint16_t h_raw = grid_ptr[coordinate_pair_offset + 1];  // y coordinate
++                const uint16_t w_raw = grid_ptr[coordinate_pair_offset + 0];  // x coordinate
++                h_coord_rel = static_cast<float>(static_cast<int16_t>(h_raw)) * GRID_FIXED_INV;
++                w_coord_rel = static_cast<float>(static_cast<int16_t>(w_raw)) * GRID_FIXED_INV;
+             } else {
+                 // For BFLOAT16 grid, read as uint16 and convert
+                 const uint32_t coordinate_pair_offset = grid_idx * STANDARD_GRID_ELEMENTS_PER_POINT;
+@@ -299,6 +323,7 @@ ALWI void process_grid_point(
+     experimental::CB scalar_cb,
+     GridPtrType grid_ptr,
+     uint32_t grid_idx,
++    uint32_t grid_k,
+     const TensorAccessor& input_tensor_accessor,
+     uint32_t batch_offset) {
+     // PyTorch grid_sample coordinate convention:
+@@ -326,6 +351,7 @@ ALWI void process_grid_point(
+     GridCoordinateReader<grid_dtype, use_precomputed_grid>::template read_grid_point(
+         grid_ptr,
+         grid_idx,
++        grid_k,
+         height_scale,
+         height_offset,
+         width_scale,
+diff --git i/ttnn/cpp/ttnn/operations/pool/grid_sample/grid_sample.cpp w/ttnn/cpp/ttnn/operations/pool/grid_sample/grid_sample.cpp
+index aabc0593cba..28c860896a2 100644
+--- i/ttnn/cpp/ttnn/operations/pool/grid_sample/grid_sample.cpp
++++ w/ttnn/cpp/ttnn/operations/pool/grid_sample/grid_sample.cpp
+@@ -22,7 +22,8 @@ ttnn::Tensor grid_sample(
+     bool use_precomputed_grid,
+     bool batch_output_channels,
+     const std::optional<MemoryConfig>& memory_config,
+-    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config) {
++    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config,
++    const std::optional<ttnn::Tensor>& batch_index) {
+     return ttnn::prim::grid_sample(
+         input_tensor,
+         grid,
+@@ -32,7 +33,8 @@ ttnn::Tensor grid_sample(
+         use_precomputed_grid,
+         batch_output_channels,
+         memory_config,
+-        compute_kernel_config);
++        compute_kernel_config,
++        batch_index);
+ }
+ 
+ }  // namespace ttnn::operations::grid_sample
+diff --git i/ttnn/cpp/ttnn/operations/pool/grid_sample/grid_sample.hpp w/ttnn/cpp/ttnn/operations/pool/grid_sample/grid_sample.hpp
+index 1ec77c3d5b0..da90a12a5da 100644
+--- i/ttnn/cpp/ttnn/operations/pool/grid_sample/grid_sample.hpp
++++ w/ttnn/cpp/ttnn/operations/pool/grid_sample/grid_sample.hpp
+@@ -29,6 +29,9 @@ namespace operations::grid_sample {
+  *   memory_config: Memory configuration for the output tensor
+  *   compute_kernel_config: Optional compute kernel configuration (math fidelity, fp32 dest
+  *     accumulation, etc.). Defaults are arch-specific.
++ *   batch_index: Optional per-grid-stick source batch (L1 sharded UINT32, one row per
++ *     grid stick). When given, the grid no longer has to be laid out in per-batch
++ *     blocks — any order works, and grid batch may be 1 while the input has N.
+  *
+  * Returns:
+  *   Output tensor of shape (N, C, H_out, W_out)
+@@ -42,7 +45,8 @@ ttnn::Tensor grid_sample(
+     bool use_precomputed_grid = false,
+     bool batch_output_channels = false,
+     const std::optional<MemoryConfig>& memory_config = std::nullopt,
+-    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config = std::nullopt);
++    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config = std::nullopt,
++    const std::optional<ttnn::Tensor>& batch_index = std::nullopt);
+ 
+ }  // namespace operations::grid_sample
+ 
+diff --git i/ttnn/cpp/ttnn/operations/pool/grid_sample/grid_sample_nanobind.cpp w/ttnn/cpp/ttnn/operations/pool/grid_sample/grid_sample_nanobind.cpp
+index 25f4c7fa2fc..de3ee87aa99 100644
+--- i/ttnn/cpp/ttnn/operations/pool/grid_sample/grid_sample_nanobind.cpp
++++ w/ttnn/cpp/ttnn/operations/pool/grid_sample/grid_sample_nanobind.cpp
+@@ -71,6 +71,11 @@ void bind_grid_sample_op(nb::module_& mod) {
+             memory_config (ttnn.MemoryConfig, optional): Output memory configuration for the operation.
+ 
+             compute_kernel_config (ttnn.DeviceComputeKernelConfig, optional): Compute kernel configuration.
++            batch_index (ttnn.Tensor, optional): Per-grid-stick source batch, L1 sharded UINT32 with
++                the same shard height as the grid. Without it the batch of a stick is its position
++                (stick i belongs to batch i / grid_hw), which forces a caller that compacts its grid
++                to keep one fixed-size block per batch. With it the grid may be a single pooled list
++                in any order, and its batch dimension may be 1 while the input has N.
+                 Notable fields:
+ 
+                 - fp32_dest_acc_en: Use FP32 destination accumulation (higher precision; halves DEST tile capacity).
+@@ -145,7 +150,8 @@ void bind_grid_sample_op(nb::module_& mod) {
+         nb::arg("use_precomputed_grid") = false,
+         nb::arg("batch_output_channels") = false,
+         nb::arg("memory_config") = nb::none(),
+-        nb::arg("compute_kernel_config") = nb::none());
++        nb::arg("compute_kernel_config") = nb::none(),
++        nb::arg("batch_index") = nb::none());
+ }
+ 
+ void bind_prepare_grid_sample_grid(nb::module_& mod) {

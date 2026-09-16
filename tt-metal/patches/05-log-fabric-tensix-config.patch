@@ -1,0 +1,16 @@
+diff --git i/tt_metal/impl/device/firmware/fabric_firmware_initializer.cpp w/tt_metal/impl/device/firmware/fabric_firmware_initializer.cpp
+index 92ffb0f4966..d3980b0d5c8 100644
+--- i/tt_metal/impl/device/firmware/fabric_firmware_initializer.cpp
++++ w/tt_metal/impl/device/firmware/fabric_firmware_initializer.cpp
+@@ -311,6 +311,11 @@ void FabricFirmwareInitializer::init(
+         control_plane_.write_routing_tables_to_all_chips();
+         compile_and_configure_fabric();
+         log_info(tt::LogMetal, "Fabric Initialized with config {}", fabric_config);
++        log_info(
++            tt::LogMetal,
++            "Fabric tensix config: {}  (MUX/UDM place mux kernels on tensix cores, which the "
++            "eth-dispatch core descriptor does not reserve)",
++            static_cast<uint32_t>(tt::tt_metal::MetalContext::instance().get_fabric_tensix_config()));
+     } else if (has_flag(descriptor_->fabric_manager(), tt_fabric::FabricManagerMode::TERMINATE_FABRIC)) {
+         log_info(tt::LogMetal, "Compiling fabric to setup fabric context for fabric termination");
+         for (auto* dev : devices_) {
